@@ -27,7 +27,8 @@ from ..common import (ArtifactResult, as_float_dict, clone_dir, get_cached,
 from ..cosmology import CosmologyParams
 
 __all__ = ["firecrown_list_examples", "firecrown_build_likelihood", "firecrown_compute_loglike",
-           "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain"]
+           "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain",
+           "firecrown_chain_status", "firecrown_plot_chain"]
 
 CONVENTIONS = {
     "parameter_names": "firecrown == pyccl: Omega_c Omega_b h n_s sigma8|A_s Omega_k Neff m_nu[eV] w0 wa T_CMB; "
@@ -50,7 +51,11 @@ CAVEATS = [
     "sigma8 vs A_s is fixed at build time (amplitude_parameter); passing the other name is reported as unused.",
     "m_nu is the summed neutrino mass in eV (0 = massless); firecrown 1.16 shows its default as [] internally.",
     "firecrown_run_chain is a Cobaya MCMC with CCL in the loop (~0.4 s per DES-Y1 3x2pt evaluation): "
-    "hundreds of samples locally, use dispatch (env_setup) for real chains.",
+    "hundreds of samples locally in the foreground, background=True for longer local runs, dispatch "
+    "(env_setup) for real chains. Its walltime_s (default ~5 s/sample, capped at 12 h) is what the "
+    "facility job requests; continue a chain that stopped at its walltime with resume=True.",
+    "w0-wa chains: CAMB's fluid dark energy cannot cross w = -1; firecrown_run_chain switches to the PPF "
+    "model automatically when wa is sampled (dark_energy_model='auto'), writing a *_ppf.yaml experiment copy.",
     "TATT / PT bias / halo-model IA factories need a pt_calculator/hm_calculator in ModelingTools and are not "
     "exposed here (they are not expressible in a plain TwoPointExperiment YAML).",
     "Remote runs: the experiment YAML and its sacc file are shipped inline (sacc <= 8 MB) unless you give "
@@ -102,9 +107,13 @@ DISPATCH_KERNELS = {
     "firecrown_chain": {
         "function": "envkernel.run_in_env", "inner": "firecrown_chain",
         "params": {"experiment_yaml": "<path>", "fixed": {}, "priors": {"sigma8": {"min": 0.6, "max": 1.0}},
-                   "max_samples": 2000, "rminus1_stop": 0.05, "work_dir": ".", "chain_prefix": "chain"},
+                   "max_samples": 2000, "rminus1_stop": 0.05, "work_dir": ".", "chain_prefix": "chain",
+                   "resume": False},
         "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
         "duration_hint_s": 7200,
+        "duration_note": "request ~5 s per sample as the job walltime (duration=), at most the facility's "
+                         "long-queue cap (Perlmutter regular 12 h); pass the same value minus 60 s as "
+                         "timeout_s; continue a chain that hit its walltime with resume=True",
         "returns": "Cobaya chain files (job CWD) + weighted means/stds/68% limits per sampled parameter",
     },
 }
@@ -408,6 +417,7 @@ def firecrown_build_likelihood(
     transfer_function: Literal["boltzmann_camb", "bbks", "eisenstein_hu", "eisenstein_hu_nowiggles", "boltzmann_class"] = "boltzmann_camb",
     scale_cuts: Annotated[list[dict] | None, Field(description="Keep-ranges per tracer: [{'tracer': 'src0', 'measurement': 'shear', 'lower': 10, 'upper': 250}] (theta arcmin or ell). measurement: shear|density|shear_e|shear_t|xi_plus|xi_minus|counts; optional 'tracer2'/'measurement2' restrict to one pair. Points outside [lower, upper] are dropped.")] = None,
     allow_empty_bins: Annotated[bool, Field(description="Allow a scale cut to remove an entire tracer pair (default True).")] = True,
+    dark_energy_model: Annotated[Literal["fluid", "ppf"], Field(description="CAMB dark-energy model written into ccl_factory.camb_extra_params: 'fluid' (CAMB default; w(a) must not cross -1) or 'ppf' (needed for w0-wa chains whose w(a) can cross -1). firecrown_run_chain switches to ppf by itself when needed.")] = "fluid",
     name: Annotated[str, Field(min_length=1, description="Stem of the YAML file.")] = "experiment",
 ) -> ArtifactResult:
     """Turn a sacc file + systematics choices into a validated firecrown experiment YAML and list every parameter the likelihood needs.
@@ -475,6 +485,8 @@ def firecrown_build_likelihood(
                         "amplitude_parameter": amplitude_parameter,
                         "pure_ccl_transfer_function": transfer_function},
     }
+    if dark_energy_model != "fluid":
+        exp["ccl_factory"]["camb_extra_params"] = {"dark_energy_model": dark_energy_model}
     cuts_applied = []
     if scale_cuts:
         filters = []
@@ -863,6 +875,203 @@ def firecrown_scan_loglike(
 firecrown_scan_loglike.weight = "dispatchable"
 
 
+# Perlmutter `regular` QOS cap; a chain longer than this must be resumed in a
+# second job (resume=True) - the engine rejects longer requests before staging.
+_WALLTIME_CAP_S = 12 * 3600
+_SECONDS_PER_SAMPLE = 5.0  # DES-Y1 3x2pt, ~0.4 s/evaluation x acceptance ~ 1/10
+
+
+def _chain_walltime(max_samples: int, walltime_s: int | None) -> tuple[int, int, list[str]]:
+    """(walltime_s, estimated_s, warnings): the walltime a chain job requests.
+
+    Default = the ~5 s/sample estimate clamped to [30 min, 12 h]; an explicit
+    walltime_s is honoured. Either way the estimate is reported, and a chain
+    that cannot finish inside the walltime gets a warning pointing at resume.
+    """
+    est = int(max(1800, max_samples * _SECONDS_PER_SAMPLE))
+    warns = []
+    if walltime_s is None:
+        walltime_s = min(est, _WALLTIME_CAP_S)
+        if est > _WALLTIME_CAP_S:
+            warns.append(f"estimated runtime {est / 3600:.1f} h exceeds the 12 h walltime cap: the chain is "
+                         f"capped at walltime_s={walltime_s}; it will stop at the walltime and can be continued "
+                         "with resume=True (same arguments).")
+    elif est > walltime_s:
+        warns.append(f"estimated runtime {est / 3600:.1f} h exceeds walltime_s={walltime_s}: the chain may stop "
+                     "before max_samples; continue it with resume=True (same arguments).")
+    return int(walltime_s), est, warns
+
+
+def _needs_ppf(priors: dict, fixed: dict) -> bool:
+    """CAMB's fluid dark energy cannot cross w = -1; PPF can. Needed when wa is
+    sampled or fixed non-zero, or when the w0 prior straddles -1."""
+    if "wa" in priors or float(fixed.get("wa", 0.0) or 0.0) != 0.0:
+        return True
+    w0 = priors.get("w0")
+    return bool(w0) and float(w0["min"]) < -1.0 < float(w0["max"])
+
+
+def _experiment_with_dark_energy_model(exp_path: Path, model: str) -> Path:
+    """A copy of the experiment YAML whose ccl_factory carries
+    camb_extra_params.dark_energy_model=<model> (no-op when already set)."""
+    import yaml
+
+    doc = yaml.safe_load(exp_path.read_text(encoding="utf-8")) or {}
+    extra = dict((doc.get("ccl_factory") or {}).get("camb_extra_params") or {})
+    if extra.get("dark_energy_model") == model:
+        return exp_path
+    extra["dark_energy_model"] = model
+    doc.setdefault("ccl_factory", {})["camb_extra_params"] = extra
+    out = exp_path.with_name(f"{exp_path.stem}_{model}.yaml")
+    out.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    return out
+
+
+def _read_chain(chain_txt: Path) -> tuple[list[str], np.ndarray]:
+    with chain_txt.open(encoding="utf-8") as fh:
+        header = fh.readline().lstrip("#").split()
+    arr = np.loadtxt(chain_txt, ndmin=2)
+    if arr.shape[1] != len(header):
+        raise ValueError(f"{chain_txt.name}: header has {len(header)} columns, data {arr.shape[1]}")
+    return header, arr
+
+
+def _read_progress(progress: Path) -> dict:
+    """Cobaya's <prefix>.progress table: N, acceptance_rate, Rminus1 rows."""
+    if not progress.is_file():
+        return {}
+    rows = []
+    for line in progress.read_text(encoding="utf-8").splitlines():
+        parts = line.lstrip("#").split()
+        if not parts or parts[0] == "N":
+            continue
+        try:
+            rows.append({"N": int(float(parts[0])), "acceptance_rate": float(parts[2]),
+                         "Rminus1": float(parts[3])})
+        except (IndexError, ValueError):
+            continue
+    if not rows:
+        return {}
+    return {"checkpoints": rows, "last": rows[-1]}
+
+
+def _trace_plot(chain_txt: Path, names: list[str], means: dict, path: Path, title: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from ..plotting import PALETTE, param_symbol, rc_params
+
+    header, arr = _read_chain(chain_txt)
+    colidx = {n: header.index(n) for n in names if n in header}
+    with plt.rc_context(rc_params(10)):
+        fig, axes = plt.subplots(len(colidx), 1, figsize=(6.4, 1.8 * len(colidx) + 0.6),
+                                 squeeze=False, constrained_layout=True, sharex=True)
+        for ax, (n, j) in zip(axes[:, 0], colidx.items()):
+            ax.plot(np.arange(len(arr)), arr[:, j], "-", color=PALETTE[0], lw=0.9)
+            if n in means:
+                ax.axhline(means[n], color=PALETTE[1], ls="--", lw=1.0)
+            ax.set_ylabel(param_symbol(n))
+        axes[-1, 0].set_xlabel("accepted step")
+        fig.suptitle(title, fontsize=10)
+        fig.savefig(path)
+        plt.close(fig)
+
+
+def _corner_plot(names: list[str], values: np.ndarray, weights: np.ndarray, path: Path, title: str) -> str:
+    """Triangle plot; getdist when importable (KDE contours), else a
+    matplotlib histogram triangle. Returns which engine drew it."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from ..plotting import PALETTE, param_symbol, rc_params
+
+    try:
+        from getdist import MCSamples, plots
+
+        with contextlib.redirect_stdout(sys.stderr):
+            mc = MCSamples(samples=values, weights=weights, names=names,
+                           labels=[param_symbol(n).strip("$") for n in names], label=title)
+            g = plots.get_subplot_plotter(width_inch=min(2.0 * len(names), 10))
+            g.triangle_plot([mc], filled=True, contour_colors=[PALETTE[0]])
+            g.export(str(path))
+        plt.close("all")
+        return "getdist"
+    except Exception:  # noqa: BLE001 - fall back to a plain histogram triangle
+        pass
+    n = len(names)
+    with plt.rc_context(rc_params(9)):
+        fig, axes = plt.subplots(n, n, figsize=(1.9 * n + 0.8, 1.9 * n + 0.8), squeeze=False)
+        for i in range(n):
+            for j in range(n):
+                ax = axes[i, j]
+                if j > i:
+                    ax.set_visible(False)
+                    continue
+                if i == j:
+                    ax.hist(values[:, i], bins=40, weights=weights, color=PALETTE[0], histtype="stepfilled", alpha=0.6)
+                else:
+                    ax.hist2d(values[:, j], values[:, i], bins=35, weights=weights, cmap="Blues")
+                if i == n - 1:
+                    ax.set_xlabel(param_symbol(names[j]))
+                else:
+                    ax.set_xticklabels([])
+                if j == 0 and i > 0:
+                    ax.set_ylabel(param_symbol(names[i]))
+                else:
+                    ax.set_yticklabels([])
+        fig.suptitle(title, fontsize=10)
+        fig.tight_layout()
+        fig.savefig(path)
+        plt.close(fig)
+    return "matplotlib"
+
+
+def _finish_chain(res: dict, outdir: Path, slug: str, exp_path: Path, plot: bool, fixed: dict,
+                  warns: list[str], computed_on: str, settings: dict) -> ArtifactResult:
+    """Shape the inner firecrown_chain result (summary CSV, trace PNG, metadata)."""
+    summary = res["summary"]
+    names = list(summary)
+    spath = outdir / f"chain_summary_{slug}.csv"
+    write_csv(spath, {"parameter_index": np.arange(len(names), dtype=float),
+                      "mean": np.array([summary[n]["mean"] for n in names]),
+                      "std": np.array([summary[n]["std"] for n in names]),
+                      "lower68": np.array([summary[n]["lower68"] for n in names]),
+                      "upper68": np.array([summary[n]["upper68"] for n in names])},
+              [f"label: Cobaya mcmc summary ({', '.join(names)})", "quantity: chain_summary",
+               f"parameters: {names}", f"experiment: {exp_path}", f"n_samples: {res['n_samples']}",
+               f"acceptance_rate: {res.get('acceptance_rate')}", f"converged: {res.get('converged')}",
+               f"Rminus1: {res.get('Rminus1')}", f"fixed: {fixed}"])
+    files = [str(spath)] + [f for f in res.get("chain_files", []) if Path(f).is_file()]
+    chain_txt = next((f for f in res.get("chain_files", []) if f.endswith(".1.txt") and Path(f).is_file()), None)
+    if plot and chain_txt:
+        try:
+            ppath = outdir / f"chain_trace_{slug}.png"
+            _trace_plot(Path(chain_txt), names, {n: summary[n]["mean"] for n in names}, ppath,
+                        f"{exp_path.stem}: Cobaya mcmc trace ({res['n_samples']} samples)")
+            files.append(str(ppath))
+        except Exception as exc:  # noqa: BLE001 - plotting is best effort
+            warns.append(f"trace plot skipped: {exc}")
+    txt = ", ".join(f"{n} = {summary[n]['mean']:.4g} +/- {summary[n]['std']:.3g}" for n in names)
+    return ArtifactResult(
+        status="success", files=files,
+        message=(f"Cobaya mcmc: {res['n_samples']} accepted samples ({res.get('n_weighted', 0):.0f} weighted), "
+                 f"acceptance {res.get('acceptance_rate') or float('nan'):.2f}, converged={res.get('converged')} "
+                 f"(R-1 = {res.get('Rminus1')}). Posterior means: {txt}."
+                 + (f" Computed on {computed_on}." if computed_on != "local" else "")
+                 + (" Short run: treat as a smoke test, not a converged posterior." if not res.get("converged") else "")
+                 + " Corner/posterior plot: firecrown_plot_chain on the .1.txt chain file."
+                 + " " + " ".join(warns)),
+        metadata={"summary": summary, "sampled": names, "fixed": fixed, "n_samples": res["n_samples"],
+                  "n_weighted": res.get("n_weighted"), "acceptance_rate": res.get("acceptance_rate"),
+                  "converged": res.get("converged"), "Rminus1": res.get("Rminus1"), "best_fit": res.get("best_fit"),
+                  "used_getdist": res.get("used_getdist"), "chain_files": res.get("chain_files", []),
+                  "chain_txt": chain_txt, "warnings": warns, "computed_on": computed_on,
+                  "experiment_yaml": str(exp_path), "cobaya_settings": settings},
+    )
+
+
 @validate_call
 def firecrown_run_chain(
     output_dir: Annotated[str, Field(min_length=1)],
@@ -877,20 +1086,28 @@ def firecrown_run_chain(
     plot: Annotated[bool, Field(description="Trace plot of the sampled parameters (needs the chain file locally).")] = True,
     env_setup: Annotated[str | None, Field(description="Required when dispatch is remote: facility environment activation (must provide firecrown + cobaya).")] = None,
     sacc_remote_path: str | None = None,
+    walltime_s: Annotated[int | None, Field(ge=300, le=86400, description="Walltime of the facility job / timeout of a local run, seconds. Default: ~5 s per sample, clamped to [30 min, 12 h] (the Perlmutter regular-QOS cap; jobs over 30 min route to that QOS). Size max_samples to it, or continue a stopped chain with resume=True.")] = None,
+    resume: Annotated[bool, Field(description="Continue a chain with the same prefix/arguments from its Cobaya checkpoint (a run that hit its walltime or max_samples) instead of starting over.")] = False,
+    background: Annotated[bool, Field(description="LOCAL runs only: start the chain as a detached subprocess and return at once with the chain paths; poll firecrown_chain_status, then firecrown_plot_chain for the posterior. Use for anything beyond a few hundred samples - a foreground local chain blocks this call for its whole runtime.")] = False,
+    dark_energy_model: Annotated[Literal["auto", "fluid", "ppf"], Field(description="CAMB dark-energy model. 'auto' (default) switches to 'ppf' when wa is sampled or non-zero, or the w0 prior straddles -1 - CAMB's fluid model cannot cross w = -1 and the chain would die with 'set the dark_energy_model to ppf'.")] = "auto",
 ) -> ArtifactResult:
     """Run a Cobaya MCMC over a firecrown experiment in pure-CCL mode (no theory block) and summarise the posterior.
 
     Heavy: each accepted step costs several likelihood evaluations (~0.4 s
     each for DES-Y1 3x2pt), so the default max_samples=200 is a smoke run
     (~minutes); real chains need thousands of samples and dispatch to a
-    facility (set_dispatch + env_setup). Cobaya 'mcmc' with uniform
-    priors, proposal = (max-min)/20 unless given, burn_in 0. Writes the
-    Cobaya chain (<prefix>.1.txt, .updated.yaml, .covmat, ...),
+    facility (set_dispatch + env_setup) or a local background run
+    (background=True). The job's walltime is walltime_s (default ~5 s per
+    sample, capped at 12 h): a chain that needs more is continued with
+    resume=True in a second call with the SAME arguments. Cobaya 'mcmc' with
+    uniform priors, proposal = (max-min)/20 unless given, burn_in 0. Writes
+    the Cobaya chain (<prefix>.1.txt, .updated.yaml, .covmat, .progress),
     chain_summary_<slug>.csv (parameter, mean, std, lower68, upper68 from
     the weighted samples; getdist means/stds when getdist is present) and
-    a trace PNG. metadata.converged / Rminus1 say whether the run reached
-    rminus1_stop (short runs will not: treat them as smoke tests). Run
-    firecrown_scan_loglike first to choose sensible prior ranges.
+    a trace PNG; firecrown_plot_chain draws the corner plot. metadata.converged
+    / Rminus1 say whether the run reached rminus1_stop (short runs will not:
+    treat them as smoke tests). Run firecrown_scan_loglike first to choose
+    sensible prior ranges.
     """
     exp_path = _exp_path(experiment_yaml)
     outdir = resolve_outdir(output_dir)
@@ -908,75 +1125,200 @@ def firecrown_run_chain(
             raise ValueError(f"prior for {k} needs min < max: {spec_}")
     point, warns = _check_point(required, cosmology, nuisance, exp_path)
     fixed = {k: v for k, v in point.items() if k not in priors}
-    spec = cosmology or CosmologyParams()
-    slug = param_slug({"priors": repr(sorted(priors.items())), "fixed": repr(sorted(fixed.items())),
-                       "n": max_samples, "seed": seed, "exp": str(exp_path)})
+    if dark_energy_model == "auto":
+        dark_energy_model = "ppf" if _needs_ppf(priors, fixed) else "fluid"
+    if dark_energy_model == "ppf":
+        exp_path = _experiment_with_dark_energy_model(exp_path, "ppf")
+        warns.append("CAMB dark_energy_model=ppf (w(a) may cross -1); experiment copy " + exp_path.name + ".")
+    walltime, est_s, wt_warns = _chain_walltime(max_samples, walltime_s)
+    warns.extend(wt_warns)
     from mcp_server.dispatch import remote_site
 
-    work_dir = str(outdir) if not remote_site() else "."
+    site = remote_site()
+    # slug excludes walltime/resume/background so a resumed chain finds its files
+    slug = param_slug({"priors": repr(sorted(priors.items())), "fixed": repr(sorted(fixed.items())),
+                       "n": max_samples, "seed": seed, "exp": str(exp_path)})
+    prefix = f"{chain_prefix}_{slug}"
+    work_dir = str(outdir) if not site else "."
     params = {"fixed": fixed, "priors": {k: as_float_dict(v) for k, v in priors.items()},
               "max_samples": max_samples, "rminus1_stop": rminus1_stop, "work_dir": work_dir,
-              "chain_prefix": f"{chain_prefix}_{slug}", "seed": seed}
-    res, computed_on = _run_inner("firecrown_chain", params, env_setup,
-                                  max(1800, int(max_samples * 5)), exp_path, sacc_remote_path)
-    summary = res["summary"]
-    names = list(summary)
-    spath = outdir / f"chain_summary_{slug}.csv"
+              "chain_prefix": prefix, "seed": seed, "resume": resume}
+    settings = {"sampler": "mcmc", "max_samples": max_samples, "rminus1_stop": rminus1_stop, "seed": seed,
+                "creation_mode": "pure_ccl_mode", "dark_energy_model": dark_energy_model,
+                "walltime_s": walltime, "estimated_seconds": est_s, "resume": resume}
+    if resume and not site and not (outdir / f"{prefix}.1.txt").is_file():
+        raise ValueError(f"resume=True but no chain {prefix}.1.txt in {outdir}: start without resume, or pass "
+                         "the same arguments as the run to continue.")
+
+    if background and not site:
+        from ..envkernel import start_in_background
+
+        job = start_in_background(env_setup, "firecrown_chain", dict(params, experiment_yaml=str(exp_path)),
+                                  job_dir=str(outdir), tag=prefix)
+        chain_txt = str(outdir / f"{prefix}.1.txt")
+        write_json(outdir / f"chain_background_{slug}.json",
+                   {**job, "chain_txt": chain_txt, "progress": str(outdir / f"{prefix}.progress"),
+                    "chain_prefix": prefix, "experiment_yaml": str(exp_path), "settings": settings})
+        return ArtifactResult(
+            status="success", files=[str(outdir / f"chain_background_{slug}.json")],
+            message=(f"Chain started in the background (pid {job['pid']}): {max_samples} max samples, "
+                     f"est. {est_s / 60:.0f} min. Poll firecrown_chain_status(chain_txt='{chain_txt}') "
+                     "(progress file: N, acceptance, R-1); when it reports finished, call "
+                     f"firecrown_plot_chain(chain_txt='{chain_txt}') for the posterior summary and plots. "
+                     + " ".join(warns)),
+            metadata={"background": job, "chain_txt": chain_txt, "chain_prefix": prefix, "sampled": list(priors),
+                      "fixed": fixed, "experiment_yaml": str(exp_path), "cobaya_settings": settings,
+                      "warnings": warns, "computed_on": "local (background)"},
+        )
+
+    res, computed_on = _run_inner("firecrown_chain", params, env_setup, walltime, exp_path, sacc_remote_path)
+    return _finish_chain(res, outdir, slug, exp_path, plot, fixed, warns, computed_on, settings)
+
+
+firecrown_run_chain.weight = "heavy"
+
+
+@validate_call
+def firecrown_chain_status(
+    chain_txt: Annotated[str, Field(min_length=1, description="The chain file <work_dir>/<prefix>.1.txt (from firecrown_run_chain's metadata.chain_txt); its .progress / .locked / background files are found next to it.")],
+) -> ArtifactResult:
+    """Cheap poll of a running or finished Cobaya chain: accepted samples so far, the latest acceptance rate and R-1 from the .progress file, and whether it is still running.
+
+    Status 'running' (Cobaya's lock file is present or the background
+    process is alive), 'finished' (background result written, or a chain
+    file with no lock), 'failed' (background driver reported an error - see
+    metadata.error / log_tail), or 'not_started'. For facility runs the
+    chain lives in the job directory; poll the facility job instead and
+    call this on the files fetched back.
+    """
+    chain = Path(chain_txt).expanduser()
+    stem = chain.name[:-len(".1.txt")] if chain.name.endswith(".1.txt") else chain.stem
+    work = chain.parent
+    progress = _read_progress(work / f"{stem}.progress")
+    n_lines = 0
+    if chain.is_file():
+        with chain.open(encoding="utf-8") as fh:
+            n_lines = sum(1 for line in fh if line.strip() and not line.startswith("#"))
+    locked = any(p.name.startswith(stem) and p.name.endswith(".locked") for p in work.glob(f"{stem}*.locked"))
+    bg = next(iter(work.glob(f"inner_firecrown_chain_{stem}_background.json")), None)
+    status, error, log_tail, result_path = "not_started", None, None, None
+    if bg is not None:
+        import json as _json
+        import os as _os
+
+        info = _json.loads(bg.read_text(encoding="utf-8"))
+        result_path = info.get("result_path")
+        log_path = info.get("log_path")
+        if log_path and Path(log_path).is_file():
+            log_tail = "\n".join(Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()[-15:])
+        if result_path and Path(result_path).is_file():
+            out = _json.loads(Path(result_path).read_text(encoding="utf-8"))
+            status = "finished" if out.get("ok") else "failed"
+            error = None if out.get("ok") else (out.get("error") or "")[-1200:]
+        else:
+            alive = False
+            try:
+                _os.kill(int(info["pid"]), 0)
+                alive = True
+            except (OSError, KeyError, ValueError):
+                alive = False
+            status = "running" if alive else ("failed" if n_lines == 0 else "stopped")
+            if not alive and not error:
+                error = "background process is gone without writing a result (killed? walltime?); see log_tail"
+    elif chain.is_file():
+        status = "running" if locked else "finished"
+    last = progress.get("last") or {}
+    return ArtifactResult(
+        status="success", files=[],
+        message=(f"Chain {stem}: {status}; {n_lines} accepted samples in the chain file"
+                 + (f"; last checkpoint N={last['N']}, acceptance {last['acceptance_rate']:.2f}, "
+                    f"R-1 = {last['Rminus1']:.3g}" if last else "; no checkpoint yet")
+                 + (f". Error: {error[:200]}" if error else "")
+                 + (". Next: firecrown_plot_chain on this chain file." if status in ("finished", "stopped") else "")),
+        metadata={"status": status, "n_samples": n_lines, "progress": progress, "locked": locked,
+                  "chain_txt": str(chain), "result_path": result_path, "error": error, "log_tail": log_tail},
+    )
+
+
+@validate_call
+def firecrown_plot_chain(
+    output_dir: Annotated[str, Field(min_length=1)],
+    chain_txt: Annotated[str, Field(min_length=1, description="A Cobaya chain file (<prefix>.1.txt) - from firecrown_run_chain here or fetched back from a facility job.")],
+    params: Annotated[list[str] | None, Field(description="Parameters to plot (default: every sampled parameter in the file, i.e. all columns except weight/minuslogpost/chi2/prior columns).")] = None,
+    burn_in_frac: Annotated[float, Field(ge=0.0, lt=0.9, description="Fraction of the chain discarded before summarising/plotting (0.3 is a common choice for a single chain; firecrown_run_chain's own summary uses the whole chain).")] = 0.3,
+    corner: Annotated[bool, Field(description="Triangle (corner) plot: getdist filled contours when getdist is installed, else a histogram triangle.")] = True,
+    trace: Annotated[bool, Field(description="Trace plot of each parameter vs accepted step.")] = True,
+) -> ArtifactResult:
+    """Posterior summary and plots from an existing Cobaya chain file: weighted means, std, 68% intervals after burn-in, a corner plot and a trace plot.
+
+    Works on any Cobaya chain (local runs, background runs once
+    firecrown_chain_status says finished, or chain files fetched back from
+    a facility job). Reads <prefix>.progress next to the file for the last
+    R-1 when present. Files: chain_posterior_<slug>.csv, chain_corner_<slug>.png,
+    chain_trace_<slug>.png.
+    """
+    chain = Path(chain_txt).expanduser()
+    if not chain.is_file():
+        raise ValueError(f"chain file not found: {chain}")
+    outdir = resolve_outdir(output_dir)
+    header, arr = _read_chain(chain)
+    skip = {"weight", "minuslogpost", "chi2", "minuslogprior"}
+    cols = [h for h in header if h not in skip and not h.startswith(("minuslogprior__", "chi2__"))]
+    names = list(params) if params else cols
+    missing = [n for n in names if n not in header]
+    if missing:
+        raise ValueError(f"parameters not in the chain: {missing}; available: {cols}")
+    n_total = arr.shape[0]
+    start = int(n_total * burn_in_frac)
+    kept = arr[start:]
+    if kept.shape[0] < 3:
+        raise ValueError(f"only {kept.shape[0]} samples after burn-in (chain has {n_total}); lower burn_in_frac.")
+    weights = kept[:, header.index("weight")] if "weight" in header else np.ones(kept.shape[0])
+    values = np.column_stack([kept[:, header.index(n)] for n in names])
+    from ..inner.firecrown_chain import _weighted_summary
+
+    summary = _weighted_summary(names, values, weights)
+    stem = chain.name[:-len(".1.txt")] if chain.name.endswith(".1.txt") else chain.stem
+    progress = _read_progress(chain.parent / f"{stem}.progress")
+    slug = param_slug({"chain": str(chain), "burn": burn_in_frac, "params": names})
+    spath = outdir / f"chain_posterior_{slug}.csv"
     write_csv(spath, {"parameter_index": np.arange(len(names), dtype=float),
                       "mean": np.array([summary[n]["mean"] for n in names]),
                       "std": np.array([summary[n]["std"] for n in names]),
                       "lower68": np.array([summary[n]["lower68"] for n in names]),
                       "upper68": np.array([summary[n]["upper68"] for n in names])},
-              [f"label: Cobaya mcmc summary ({', '.join(names)})", "quantity: chain_summary",
-               f"parameters: {names}", f"experiment: {exp_path}", f"n_samples: {res['n_samples']}",
-               f"acceptance_rate: {res.get('acceptance_rate')}", f"converged: {res.get('converged')}",
-               f"Rminus1: {res.get('Rminus1')}", f"fixed: {fixed}"])
-    files = [str(spath)] + [f for f in res.get("chain_files", []) if Path(f).is_file()]
-    chain_txt = next((f for f in res.get("chain_files", []) if f.endswith(".1.txt") and Path(f).is_file()), None)
-    if plot and chain_txt:
+              [f"label: posterior summary after {burn_in_frac:.0%} burn-in ({', '.join(names)})",
+               "quantity: chain_posterior", f"parameters: {names}", f"chain: {chain}",
+               f"n_total: {n_total}", f"n_kept: {kept.shape[0]}",
+               f"Rminus1_last: {(progress.get('last') or {}).get('Rminus1')}"])
+    files = [str(spath)]
+    warns = []
+    engine = None
+    title = f"{stem} ({kept.shape[0]} samples after {burn_in_frac:.0%} burn-in)"
+    if corner:
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            from ..plotting import PALETTE, param_symbol, rc_params
-
-            with open(chain_txt, encoding="utf-8") as fh:
-                header = fh.readline().lstrip("#").split()
-            arr = np.loadtxt(chain_txt, ndmin=2)
-            colidx = {n: header.index(n) for n in names if n in header}
-            with plt.rc_context(rc_params(10)):
-                fig, axes = plt.subplots(len(colidx), 1, figsize=(6.4, 1.8 * len(colidx) + 0.6),
-                                         squeeze=False, constrained_layout=True, sharex=True)
-                for ax, (n, j) in zip(axes[:, 0], colidx.items()):
-                    ax.plot(np.arange(len(arr)), arr[:, j], "-", color=PALETTE[0], lw=0.9)
-                    ax.axhline(summary[n]["mean"], color=PALETTE[1], ls="--", lw=1.0)
-                    ax.set_ylabel(param_symbol(n))
-                axes[-1, 0].set_xlabel("accepted step")
-                fig.suptitle(f"{exp_path.stem}: Cobaya mcmc trace ({res['n_samples']} samples)", fontsize=10)
-                ppath = outdir / f"chain_trace_{slug}.png"
-                fig.savefig(ppath)
-                plt.close(fig)
-            files.append(str(ppath))
-        except Exception as exc:  # noqa: BLE001 - plotting is best effort
+            cpath = outdir / f"chain_corner_{slug}.png"
+            engine = _corner_plot(names, values, np.asarray(weights, float), cpath, title)
+            files.append(str(cpath))
+        except Exception as exc:  # noqa: BLE001
+            warns.append(f"corner plot skipped: {exc}")
+    if trace:
+        try:
+            tpath = outdir / f"chain_trace_{slug}.png"
+            _trace_plot(chain, names, {n: summary[n]["mean"] for n in names}, tpath, f"{stem}: trace")
+            files.append(str(tpath))
+        except Exception as exc:  # noqa: BLE001
             warns.append(f"trace plot skipped: {exc}")
-    txt = ", ".join(f"{n} = {summary[n]['mean']:.4g} +/- {summary[n]['std']:.3g}" for n in names)
+    txt = ", ".join(f"{n} = {summary[n]['mean']:.4g} [{summary[n]['lower68']:.4g}, {summary[n]['upper68']:.4g}]"
+                    for n in names)
+    last = progress.get("last") or {}
     return ArtifactResult(
         status="success", files=files,
-        message=(f"Cobaya mcmc: {res['n_samples']} accepted samples ({res.get('n_weighted', 0):.0f} weighted), "
-                 f"acceptance {res.get('acceptance_rate') or float('nan'):.2f}, converged={res.get('converged')} "
-                 f"(R-1 = {res.get('Rminus1')}). Posterior means: {txt}."
-                 + (f" Computed on {computed_on}." if computed_on != "local" else "")
-                 + (" Short run: treat as a smoke test, not a converged posterior." if not res.get("converged") else "")
-                 + " " + " ".join(warns)),
-        metadata={"summary": summary, "sampled": names, "fixed": fixed, "n_samples": res["n_samples"],
-                  "n_weighted": res.get("n_weighted"), "acceptance_rate": res.get("acceptance_rate"),
-                  "converged": res.get("converged"), "Rminus1": res.get("Rminus1"), "best_fit": res.get("best_fit"),
-                  "used_getdist": res.get("used_getdist"), "chain_files": res.get("chain_files", []),
-                  "warnings": warns, "computed_on": computed_on, "experiment_yaml": str(exp_path),
-                  "cobaya_settings": {"sampler": "mcmc", "max_samples": max_samples, "rminus1_stop": rminus1_stop,
-                                      "seed": seed, "creation_mode": "pure_ccl_mode"}},
+        message=(f"Posterior from {chain.name}: {kept.shape[0]} of {n_total} samples after {burn_in_frac:.0%} burn-in"
+                 + (f", last R-1 = {last['Rminus1']:.3g}" if last else "")
+                 + f". Means [68%]: {txt}."
+                 + (f" Corner plot drawn with {engine}." if engine else "") + " " + " ".join(warns)),
+        metadata={"summary": summary, "parameters": names, "n_total": n_total, "n_kept": int(kept.shape[0]),
+                  "burn_in_frac": burn_in_frac, "progress": progress, "corner_engine": engine,
+                  "chain_txt": str(chain), "warnings": warns},
     )
-
-
-firecrown_run_chain.weight = "heavy"

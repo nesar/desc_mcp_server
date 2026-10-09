@@ -99,7 +99,9 @@ formula — for sacc files that lack a covariance, e.g. TXPipe `twopoint_data_*.
 | `compute_loglike` | L | loglike, chi2, per-statistic chi2, theory-vs-data CSV; casts ints to float; full update/prepare/reset cycle |
 | `compute_theory_data_vector` | L/M | theory C_ell/xi for a sacc (with or without data) + optional noiseless/noisy realization sacc via `make_realization` |
 | `scan_loglike` | M | 1-D (or 2-D grid) profile; CSV + PNG |
-| `run_firecrown_chain` | H | Cobaya MCMC in PURE_CCL mode (no theory block); dispatch; returns chain + summary |
+| `run_firecrown_chain` | H | Cobaya MCMC in PURE_CCL mode (no theory block); dispatch; returns chain + summary. `walltime_s` (default ~5 s/sample, capped 12 h), `resume`, local `background`, `dark_energy_model` auto-PPF when w(a) can cross -1 |
+| `firecrown_chain_status` | L | poll a running/finished chain: samples so far, acceptance, R-1 from `.progress`, background process state |
+| `firecrown_plot_chain` | L | posterior summary after burn-in + getdist corner plot + trace from any Cobaya chain file |
 
 ### augur_tools (6) — augur 1.2.4, env-kernel dispatch
 `list_augur_examples`, `generate_forecast_config` (Y1/Y10, probes, bins, ndens, sigma_e, ell binning,

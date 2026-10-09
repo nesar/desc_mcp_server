@@ -14,6 +14,9 @@ params (JSON):
   work_dir        : str   where the chain files are written (job CWD remotely)
   chain_prefix    : str   file prefix inside work_dir
   seed            : int | None
+  resume          : bool  continue from the Cobaya checkpoint of a previous run
+                          with the same prefix (walltime-bounded chains); the
+                          sampler settings must match that run
 
 returns: {"chain_files": [...], "n_samples", "acceptance_rate", "summary":
           {name: {"mean", "std", "lower68", "upper68"}}, "sampled": [...],
@@ -66,6 +69,7 @@ def main(params: dict) -> dict:
     work_dir = os.path.abspath(params.get("work_dir") or os.getcwd())
     prefix = str(params.get("chain_prefix") or "chain")
     seed = params.get("seed")
+    resume = bool(params.get("resume", False))
     os.makedirs(work_dir, exist_ok=True)
 
     # cheap check that the experiment loads and learn the required names
@@ -108,8 +112,10 @@ def main(params: dict) -> dict:
         "sampler": {"mcmc": {"max_samples": max_samples, "Rminus1_stop": rminus1_stop,
                              "burn_in": 0, "max_tries": 10 * max(1, len(priors)) * 100}},
         "output": os.path.join(work_dir, prefix),
-        "force": True,
     }
+    # resume continues from <prefix>.checkpoint (Cobaya refuses mismatched
+    # settings); force restarts over any previous files of this prefix.
+    info["resume" if resume else "force"] = True
     if seed is not None:
         info["sampler"]["mcmc"]["seed"] = int(seed)
 

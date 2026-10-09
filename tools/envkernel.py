@@ -100,6 +100,57 @@ with open({result_path!r}, "w", encoding="utf-8") as fh:
 """
 
 
+def _write_driver(inner: str, params: dict, job_dir: str, tag: str = "") -> tuple[str, str, str]:
+    """Write params + driver for ``tools.inner.<inner>`` into job_dir;
+    returns (params_path, driver_path, result_path). ``tag`` keeps several
+    runs of the same inner script apart (background chains)."""
+    stem = f"inner_{inner}" + (f"_{tag}" if tag else "")
+    params_path = os.path.join(job_dir, f"{stem}_params.json")
+    result_path = os.path.join(job_dir, f"{stem}_result.json")
+    driver_path = os.path.join(job_dir, f"{stem}_driver.py")
+    with open(params_path, "w", encoding="utf-8") as fh:
+        json.dump(params, fh)
+    with open(driver_path, "w", encoding="utf-8") as fh:
+        fh.write(_DRIVER.format(job_dir=job_dir, pack_root=PACK_ROOT, inner=inner,
+                                params_path=params_path, result_path=result_path))
+    return params_path, driver_path, result_path
+
+
+def start_in_background(env_setup: str | None, inner: str, params: dict,
+                        job_dir: str, tag: str = "") -> dict:
+    """Start ``tools.inner.<inner>.main(params)`` as a DETACHED subprocess and
+    return at once: {"pid", "driver_path", "result_path", "log_path",
+    "started_at"}. Under ``env_setup`` when given, else this interpreter.
+    The result file appears when the run ends ({"ok": ..}); stdout/stderr
+    go to the log file. Local long runs only - on a facility the job IS the
+    background."""
+    import sys
+    import time
+
+    if not inner.replace("_", "").isalnum():
+        raise ValueError(f"invalid inner script name {inner!r}.")
+    job_dir = str(Path(job_dir).resolve())
+    os.makedirs(job_dir, exist_ok=True)
+    _, driver_path, result_path = _write_driver(inner, params, job_dir, tag)
+    stem = f"inner_{inner}" + (f"_{tag}" if tag else "")
+    log_path = os.path.join(job_dir, f"{stem}_driver.log")
+    if env_setup and env_setup.strip():
+        argv = ["bash", "-lc", f"{env_setup.strip().rstrip(';')}; exec python {driver_path!s}"]
+    else:
+        argv = [sys.executable, driver_path]
+    log = open(log_path, "ab")  # noqa: SIM115 - handed to the child
+    try:
+        proc = subprocess.Popen(argv, cwd=job_dir, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        log.close()
+    info = {"pid": proc.pid, "driver_path": driver_path, "result_path": result_path, "log_path": log_path,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "inner": inner, "job_dir": job_dir}
+    with open(os.path.join(job_dir, f"{stem}_background.json"), "w", encoding="utf-8") as fh:
+        json.dump(info, fh, indent=1)
+    return info
+
+
 def run_in_env(env_setup: str, inner: str, params: dict,
                timeout_s: int = 3000, job_dir: str | None = None) -> dict | str:
     """Run ``tools.inner.<inner>.main(params)`` under ``env_setup``.
@@ -114,14 +165,7 @@ def run_in_env(env_setup: str, inner: str, params: dict,
     if not inner.replace("_", "").isalnum():
         return f"Error: invalid inner script name {inner!r}."
     job_dir = str(Path(job_dir or os.getcwd()).resolve())
-    params_path = os.path.join(job_dir, f"inner_{inner}_params.json")
-    result_path = os.path.join(job_dir, f"inner_{inner}_result.json")
-    driver_path = os.path.join(job_dir, f"inner_{inner}_driver.py")
-    with open(params_path, "w", encoding="utf-8") as fh:
-        json.dump(params, fh)
-    with open(driver_path, "w", encoding="utf-8") as fh:
-        fh.write(_DRIVER.format(job_dir=job_dir, pack_root=PACK_ROOT, inner=inner,
-                                params_path=params_path, result_path=result_path))
+    _, driver_path, result_path = _write_driver(inner, params, job_dir)
     cmd = f"{env_setup.strip().rstrip(';')}; python {driver_path!s}"
     try:
         proc = subprocess.run(["bash", "-lc", cmd], cwd=job_dir, capture_output=True,

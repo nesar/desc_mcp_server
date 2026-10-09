@@ -76,3 +76,11 @@ def test_manifest_has_no_identity_and_env_candidates():
             assert f"tools/inner/{k['inner']}.py" in pack["files"], name
         else:
             assert "pip_deps" in k, name
+
+
+def test_manifest_documents_walltime_and_timeout():
+    pack = export_dispatch_pack()["dispatch_pack"]
+    env = pack["env_kernel"]
+    assert "timeout_s" in env["args"] and "walltime" in env
+    assert "timeout_s" in pack["usage"] and "duration" in pack["usage"]
+    assert "duration_note" in pack["kernels"]["firecrown_chain"]

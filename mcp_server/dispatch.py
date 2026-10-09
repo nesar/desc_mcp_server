@@ -113,18 +113,24 @@ def export_dispatch_pack() -> dict:
                 "function": "envkernel.run_in_env",
                 "args": {"env_setup": "<shell snippet activating a facility env with the DESC stack>",
                          "inner": "<inner script name, see each kernel's 'inner'>",
-                         "params": "<the kernel's params object>"},
+                         "params": "<the kernel's params object>",
+                         "timeout_s": "<job walltime minus ~60 s; default 3000 - ALWAYS pass it, "
+                                      "the inner script is killed at this many seconds>"},
                 "base_pip_deps": [],
                 "env_setup_candidates": ENV_SETUP_CANDIDATES,
+                "walltime": "each kernel's duration_hint_s is a FLOOR for the job's duration=; size the "
+                            "real request to the work (chains: ~5 s per sample) within the facility caps "
+                            "(Perlmutter debug 30 min / regular 12 h; Polaris debug 60 min) and pass "
+                            "timeout_s = duration - 60 in args.",
                 "note": "env_setup is chosen by the user/client; this server ships only "
                         "documented public candidates and never a default identity.",
             },
             "usage": (
                 "Save these files on the CLIENT machine, then dispatch with the "
                 "hep-genesis facility server: run_pack_kernel(pack=<saved dir>/tools, "
-                "function=<kernel function>, args={...}, pip_deps=<kernel pip deps or []>). "
-                "For env-kernels pass function='envkernel.run_in_env' with "
-                "args={env_setup, inner, params}."
+                "function=<kernel function>, args={...}, pip_deps=<kernel pip deps or []>, "
+                "duration=<walltime s>). For env-kernels pass function='envkernel.run_in_env' with "
+                "args={env_setup, inner, params, timeout_s} and the same walltime as duration."
             ),
         }
     }
@@ -183,11 +189,18 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
                 pass
         from hep_genesis.iri.dispatch.hints import dispatch_auth_hint
         hint = dispatch_auth_hint(site, body or str(exc))
+        walltime = any(k in (body + str(exc)).lower()
+                       for k in ("qosmaxwalldurationperjoblimit", "walltime", "qos cap", "queue cap"))
+        advice = (
+            "This is a WALLTIME rejection, not auth: resubmit ONCE with a duration the queue admits "
+            "(shorter walltime_s / fewer samples, or a longer queue) - never the same arguments."
+            if walltime else
+            "Do NOT resubmit the same arguments - the failure is in the dispatch layer and will recur. "
+            "Surface this error to the user."
+        )
         raise RuntimeError(
             f"Remote dispatch to {site} failed: {exc}\n"
-            f"{('Response body: ' + body) if body else ''}{hint}\n"
-            "Do NOT retry this call - the failure is in the dispatch layer "
-            "and will recur. Surface this error to the user."
+            f"{('Response body: ' + body) if body else ''}{hint}\n{advice}"
         ) from exc
     if result.get("status") != "success":
         raise RuntimeError(
@@ -251,11 +264,18 @@ def set_dispatch(site: str, artifact_dir: str | None = None) -> str:
     )
     _state["site"] = site
     facility = "ALCF" if site == "polaris" else "NERSC"
+    from tools.envkernel import ENV_SETUP_CANDIDATES
+
+    candidates = "; ".join(f"{c['name']}: {c['env_setup']}" for c in ENV_SETUP_CANDIDATES.get(site, []))
+    caps = ("Perlmutter walltime caps: debug 30 min, regular 12 h (jobs over 30 min route to regular)"
+            if site == "perlmutter" else
+            "Polaris walltime caps: debug 60 min, preemptable 72 h (single-node jobs over 60 min route there)")
     return (
         f"Dispatch: remote on {site} ({facility}) - heavy tools will stage this "
         "server's kernels, submit via IRI, and fetch results back. Each call is "
-        "one facility job (expect minutes). Tools needing the DESC stack on the "
-        "node take env_setup (e.g. the desc-python activation on NERSC)."
+        "one facility job (minutes to hours; the call stays alive with progress "
+        f"heartbeats). {caps}. Tools needing the DESC stack on the node take "
+        f"env_setup - candidates: {candidates}."
     )
 
 

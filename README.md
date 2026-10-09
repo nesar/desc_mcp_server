@@ -55,7 +55,7 @@ hep-genesis-agent desktop app's server list — at the HTTP endpoint
 | meta | `list_desc_packages`, `describe_desc_tool_family`, `list_desc_skills`, `load_desc_skill`, `convert_cosmology_names` | registry + skills + name maps |
 | ccl | `ccl_describe_cosmology`, `ccl_background`, `ccl_matter_pk`, `ccl_lsst_srd_nz`, `ccl_angular_cls`, `ccl_correlation_functions`, `ccl_correlation_3d`, `ccl_halo_mass_function`, `ccl_halo_model_pk`, `ccl_baryon_boost` | pyccl 3.3.6 (+ CAMB, CosmicEmu, bacco, HMcode) |
 | sacc | `sacc_inspect`, `sacc_to_csv`, `sacc_prepare_for_firecrown`, `sacc_attach_gaussian_covariance` | sacc 2.4 (+ pyccl for the Gaussian covariance) |
-| firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain` | firecrown 1.16 factory API, Cobaya (pure-CCL mode) |
+| firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain`, `firecrown_chain_status`, `firecrown_plot_chain` | firecrown 1.16 factory API, Cobaya (pure-CCL mode; background runs, resume, auto-PPF for w0-wa), getdist corner plots |
 | augur | `augur_list_examples`, `augur_generate_forecast_config`, `augur_validate_forecast_config`, `augur_generate_synthetic_datavector`, `augur_compute_fisher`, `augur_plot_fisher_contours` | augur 1.2.4 (+ TJPCov, numdifftools / derivkit) |
 | txpipe | `txpipe_list_stages`, `txpipe_describe_stage`, `txpipe_list_examples`, `txpipe_generate_pipeline`, `txpipe_validate_pipeline`, `txpipe_run_pipeline`, `txpipe_run_status`, `txpipe_fetch_example_data` | TXPipe source (read as metadata) + ceci; runs in a separate TXPipe env or on a facility |
 | tjpcov | `tjpcov_list_covariance_types`, `tjpcov_generate_config`, `tjpcov_compute_covariance`, `tjpcov_compare_covariances` | tjpcov 0.5.1: Gaussian f_sky (harmonic and real space), halo-model SSC and cNG terms; NaMaster-coupled types need NaMaster 2.x (facility env) |
@@ -122,8 +122,17 @@ sign-in on the client plus a facility environment for the DESC stack
 environment you built from `desc-cosmology-env` — see `ENVIRONMENT.md`).
 Every chain, forecast and pipeline below goes through `export_dispatch_pack`
 (hosted server) or `set_dispatch` (server on your own machine); the tools
-report the host they ran on. Chains longer than ~30 minutes on Perlmutter
-need the `regular` QOS (`NERSC_MCMC_QOS`), not `debug`.
+report the host they ran on. Heavy tools take an explicit walltime
+(`walltime_s` on chains, `duration_s` on forecasts, `walltime_s` on TXPipe
+runs); the hep-genesis engine routes jobs over the debug cap (Perlmutter
+30 min, Polaris 60 min) to the long queue by itself and rejects durations no
+queue admits before staging. A chain that stops at its walltime is continued
+with `resume=True` and the same arguments. While a heavy call waits for a
+facility job it sends MCP progress heartbeats (every `MCP_HEARTBEAT_S`,
+default 30 s), so clients that reset their request timeout on progress keep
+the call alive; a long LOCAL chain should use `background=True` and be
+polled with `firecrown_chain_status`, then summarised with
+`firecrown_plot_chain`.
 
 12. **MCMC** — *"Build the firecrown likelihood for the DES Y1 3x2pt test data vector, check chi2/dof at the fiducial point, then run a Cobaya chain on Perlmutter with the desc-python environment sampling Omega_c, sigma8, w0, wa, h, n_s and the five lens biases with uniform priors, max_samples 20000 and R-1 < 0.02. Report whether it converged, the means and 68% intervals, and the trace plot."* (`firecrown_run_chain`; a `max_samples` of 200 is the local smoke run)
 13. **Same chain on ALCF** — *"Export the dispatch pack and run the same chain on Polaris under my environment at `/eagle/<project>/<user>/envs/desc-cosmology`; compare the posterior means and R-1 with the Perlmutter run and confirm both hosts."*

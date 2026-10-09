@@ -1,12 +1,14 @@
+import asyncio
 import functools
 import importlib
 import inspect
 import os
+import time
 from pathlib import Path
 import tomllib
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 Transport = Literal["stdio", "streamable-http"]
@@ -42,6 +44,73 @@ def publish_outputs(func):
                 result.message += " View: " + "  ".join(urls)
         return result
 
+    return wrapper
+
+
+# Progress heartbeat period for heavy tools. The hep-genesis desktop attaches
+# a progress token to every call and resets its 45-min per-request timeout on
+# each notification (24 h cap); a silent call is given up after 45 min and the
+# result of a job the user paid for is lost (observed with a 6-hour local
+# chain and an hour-long Perlmutter queue wait, 2026-10-08).
+HEARTBEAT_S = float(os.environ.get("MCP_HEARTBEAT_S", "30"))
+# Heavy tools share process state (experiment caches, dispatch env vars) and
+# were serialized implicitly by blocking the event loop; keep them serialized.
+_HEAVY_LOCK: asyncio.Lock | None = None
+
+
+def _heavy_lock() -> asyncio.Lock:
+    global _HEAVY_LOCK
+    if _HEAVY_LOCK is None:
+        _HEAVY_LOCK = asyncio.Lock()
+    return _HEAVY_LOCK
+
+
+async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: float | None = None, **kwargs):
+    """Run blocking ``func`` in a worker thread, sending an MCP progress
+    notification every ``heartbeat_s`` seconds while it runs (no-op without
+    a request context / progress token)."""
+    period = HEARTBEAT_S if heartbeat_s is None else heartbeat_s
+    task = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    started = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=period)
+            if done:
+                return task.result()
+            if ctx is not None:
+                elapsed = int(time.monotonic() - started)
+                try:
+                    await ctx.report_progress(elapsed, None, f"{label}: {elapsed // 60} min elapsed (still running)")
+                except Exception:  # noqa: BLE001 - progress is advisory
+                    pass
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def offload_heavy(func):
+    """Wrap a heavy (weight == "heavy") tool: it runs off the event loop under
+    the shared heavy lock and heartbeats progress while it runs. The MCP
+    schema is unchanged - the extra ``ctx`` parameter is the FastMCP
+    Context, injected by the server and hidden from clients."""
+    # eval_str: tool modules using `from __future__ import annotations` carry
+    # string annotations that only resolve in THEIR globals - the wrapper
+    # lives here, so hand FastMCP/pydantic the resolved objects.
+    sig = inspect.signature(func, eval_str=True)
+    params = [p for p in sig.parameters.values() if p.kind is not inspect.Parameter.VAR_KEYWORD]
+    params.append(inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context))
+
+    @functools.wraps(func)
+    async def wrapper(*args, ctx: Context | None = None, **kwargs):
+        async with _heavy_lock():
+            return await run_with_heartbeat(ctx, func, *args, label=func.__name__, **kwargs)
+
+    wrapper.__signature__ = sig.replace(parameters=params)
+    annotations = {p.name: p.annotation for p in params if p.annotation is not inspect.Parameter.empty}
+    if sig.return_annotation is not inspect.Signature.empty:
+        annotations["return"] = sig.return_annotation
+    wrapper.__annotations__ = annotations
+    wrapper.weight = getattr(func, "weight", "heavy")
     return wrapper
 
 
@@ -134,6 +203,8 @@ def create_server(*, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
             tool_function = getattr(tool_module, name)
             if OUTPUT_ROOT:
                 tool_function = publish_outputs(tool_function)
+            if getattr(tool_function, "weight", "") == "heavy":
+                tool_function = offload_heavy(tool_function)
             mcp.tool()(tool_function)
 
     register_skill_prompts(mcp)

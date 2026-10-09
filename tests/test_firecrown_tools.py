@@ -166,3 +166,85 @@ def test_run_chain_smoke(experiment, work):
     assert any(Path(f).name.startswith("chain_summary_") for f in r.files)
     json.dumps(m)
     assert "smoke test" in r.message  # not converged in 4 samples
+
+
+def test_chain_walltime_policy():
+    from tools.firecrown_tools import _chain_walltime, _needs_ppf
+
+    wt, est, warns = _chain_walltime(20000, None)
+    assert wt == 12 * 3600 and est == 100000 and any("resume=True" in w for w in warns)
+    wt, est, warns = _chain_walltime(200, None)
+    assert wt == 1800 and not warns
+    wt, est, warns = _chain_walltime(20000, 3500)
+    assert wt == 3500 and any("may stop" in w for w in warns)
+    assert _needs_ppf({"wa": {"min": -3, "max": 1}}, {})
+    assert _needs_ppf({"w0": {"min": -2, "max": -0.3}}, {})
+    assert not _needs_ppf({"w0": {"min": -1, "max": -0.3}}, {"wa": 0.0})
+    assert _needs_ppf({"sigma8": {"min": 0.6, "max": 1}}, {"wa": 0.3})
+
+
+def test_run_chain_auto_ppf_w0wa(experiment, work):
+    pytest.importorskip("cobaya")
+    r = firecrown_run_chain(output_dir=str(work / "chain_ppf"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"w0": {"min": -1.6, "max": -0.6}, "wa": {"min": -1.0, "max": 1.0}},
+                            nuisance=FIDUCIAL, max_samples=4, seed=2, plot=False)
+    m = r.metadata
+    assert m["cobaya_settings"]["dark_energy_model"] == "ppf"
+    assert m["experiment_yaml"].endswith("_ppf.yaml") and Path(m["experiment_yaml"]).is_file()
+    assert m["n_samples"] >= 4 and set(m["sampled"]) == {"w0", "wa"}
+    assert m["cobaya_settings"]["walltime_s"] == 1800
+
+
+def test_chain_status_and_plot(experiment, work):
+    pytest.importorskip("cobaya")
+    from tools.firecrown_tools import firecrown_chain_status, firecrown_plot_chain
+
+    r = firecrown_run_chain(output_dir=str(work / "chain"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"sigma8": {"min": 0.6, "max": 1.0}}, nuisance=FIDUCIAL,
+                            max_samples=4, seed=1)
+    chain_txt = r.metadata["chain_txt"]
+    assert chain_txt and chain_txt.endswith(".1.txt")
+    st = firecrown_chain_status(chain_txt=chain_txt)
+    assert st.metadata["status"] == "finished" and st.metadata["n_samples"] >= 4
+    assert st.metadata["progress"].get("last") is not None or st.metadata["n_samples"] < 320
+    p = firecrown_plot_chain(output_dir=str(work / "chain"), chain_txt=chain_txt, burn_in_frac=0.25)
+    assert p.metadata["parameters"] == ["sigma8"]
+    assert 0.6 <= p.metadata["summary"]["sigma8"]["mean"] <= 1.0
+    assert any(f.endswith(".png") and "corner" in f for f in p.files)
+    assert any(f.endswith(".png") and "trace" in f for f in p.files)
+    assert any(Path(f).name.startswith("chain_posterior_") for f in p.files)
+    json.dumps(p.metadata)
+    with pytest.raises(ValueError):
+        firecrown_plot_chain(output_dir=str(work / "chain"), chain_txt=chain_txt, params=["nope"])
+
+
+def test_run_chain_background_then_status(experiment, work):
+    pytest.importorskip("cobaya")
+    import time
+
+    from tools.firecrown_tools import firecrown_chain_status, firecrown_plot_chain
+
+    r = firecrown_run_chain(output_dir=str(work / "chain_bg"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"sigma8": {"min": 0.6, "max": 1.0}}, nuisance=FIDUCIAL,
+                            max_samples=4, seed=3, background=True)
+    m = r.metadata
+    assert m["background"]["pid"] > 0 and m["computed_on"] == "local (background)"
+    chain_txt = m["chain_txt"]
+    deadline = time.time() + 420
+    status = None
+    while time.time() < deadline:
+        status = firecrown_chain_status(chain_txt=chain_txt).metadata
+        if status["status"] in ("finished", "failed"):
+            break
+        time.sleep(3)
+    assert status is not None and status["status"] == "finished", status
+    p = firecrown_plot_chain(output_dir=str(work / "chain_bg"), chain_txt=chain_txt, burn_in_frac=0.0, corner=False)
+    assert p.metadata["n_total"] >= 4
+
+
+def test_run_chain_resume_requires_existing_chain(experiment, work):
+    pytest.importorskip("cobaya")
+    with pytest.raises(ValueError, match="resume=True"):
+        firecrown_run_chain(output_dir=str(work / "chain_none"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"sigma8": {"min": 0.6, "max": 1.0}}, nuisance=FIDUCIAL,
+                            max_samples=4, seed=9, resume=True)
