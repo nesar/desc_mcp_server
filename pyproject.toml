@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desc-mcp-server"
+version = "0.1.0"
+description = "MCP server exposing the LSST DESC cosmology stack (CCL, sacc, firecrown, augur, TXPipe) as agent tools, with HPC dispatch via hep-genesis."
+readme = "README.md"
+requires-python = ">=3.12"
+# The DESC packages (pyccl, sacc, firecrown, augur, tjpcov, ceci) are managed by
+# scripts/setup_env.sh (conda-forge only; firecrown/numcosmo are not on PyPI) —
+# see ENVIRONMENT.md. Listed here are only the server's own direct needs.
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "pydantic>=2,<3",
+    "numpy>=2",
+    "scipy",
+    "matplotlib>=3.8",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "anyio"]
+
+[tool.mcp-server]
+tool_modules = [
+    "tools.meta",
+    "tools.ccl",
+    "tools.sacc_tools",
+    "tools.firecrown_tools",
+    "tools.augur_tools",
+    "tools.txpipe_tools",
+    "mcp_server.dispatch",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*", "tools*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

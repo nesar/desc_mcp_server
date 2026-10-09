@@ -1,0 +1,982 @@
+"""firecrown likelihood tools: build a TwoPointExperiment from a sacc file,
+evaluate log-likelihoods, theory vectors, 1-D profiles and Cobaya chains.
+
+Computation goes through env-kernel inner scripts (tools/inner/
+firecrown_loglike.py, firecrown_theory.py, firecrown_chain.py) so the SAME
+code runs in-process locally and under a facility environment remotely
+(hep-genesis dispatch, env_setup chosen by the client). Wrappers here only
+validate, write CSV/PNG/YAML and shape metadata.
+
+Parameter names are firecrown's: cosmology Omega_c Omega_b h n_s sigma8|A_s
+Omega_k Neff m_nu w0 wa T_CMB; per-bin nuisance {tracer}_{param}
+(src0_delta_z, src0_mult_bias, lens0_bias, lens0_delta_z, ...); global IA
+ia_bias alphaz z_piv.
+"""
+
+import contextlib
+import sys
+import pathlib
+from pathlib import Path
+from typing import Annotated, Literal
+
+import numpy as np
+from pydantic import Field, validate_call
+
+from ..common import (ArtifactResult, as_float_dict, clone_dir, get_cached,
+                      param_slug, resolve_outdir, write_csv, write_json)
+from ..cosmology import CosmologyParams
+
+__all__ = ["firecrown_list_examples", "firecrown_build_likelihood", "firecrown_compute_loglike",
+           "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain"]
+
+CONVENTIONS = {
+    "parameter_names": "firecrown == pyccl: Omega_c Omega_b h n_s sigma8|A_s Omega_k Neff m_nu[eV] w0 wa T_CMB; "
+                       "nuisance {tracer}_{param}: src0_delta_z src0_mult_bias lens0_bias lens0_delta_z "
+                       "lens0_sigma_z lens0_alphaz lens0_mag_bias; global IA: ia_bias alphaz z_piv",
+    "experiment_yaml": "firecrown TwoPointExperiment YAML (data_source + two_point_factory + ccl_factory); "
+                       "sacc path stored absolute; produced by firecrown_build_likelihood",
+    "ccl_mode": "pure_ccl_mode: CCL computes background and P(k) itself (no CAMB/CLASS sampler block)",
+    "lifecycle": "every evaluation is tools.update -> tools.prepare -> like.update -> compute -> like.reset; tools.reset",
+    "loglike": "ConstGaussian: loglike = -chi2/2 with the sacc covariance (dense, must be positive definite)",
+    "units": "theta arcmin, ell integer, C_ell dimensionless, xi dimensionless",
+    "cache": "the (likelihood, tools) pair per experiment YAML is cached in-process (reloaded if the YAML changes)",
+}
+CAVEATS = [
+    "Every sampler parameter must be present (ParamsMap): the tools fill firecrown defaults for anything you "
+    "do not pass, so check metadata.required_parameters and metadata.unused_keys (keys you passed that the "
+    "likelihood does not use - typos are silent otherwise).",
+    "MultiplicativeShearBias defaults to 1.0 (!) in firecrown; DES-like analyses use ~0.01. "
+    "NumberCounts bias defaults to 1.5. Pass nuisance values explicitly.",
+    "sigma8 vs A_s is fixed at build time (amplitude_parameter); passing the other name is reported as unused.",
+    "m_nu is the summed neutrino mass in eV (0 = massless); firecrown 1.16 shows its default as [] internally.",
+    "firecrown_run_chain is a Cobaya MCMC with CCL in the loop (~0.4 s per DES-Y1 3x2pt evaluation): "
+    "hundreds of samples locally, use dispatch (env_setup) for real chains.",
+    "TATT / PT bias / halo-model IA factories need a pt_calculator/hm_calculator in ModelingTools and are not "
+    "exposed here (they are not expressible in a plain TwoPointExperiment YAML).",
+    "Remote runs: the experiment YAML and its sacc file are shipped inline (sacc <= 8 MB) unless you give "
+    "sacc_remote_path (a facility path).",
+]
+
+_EXAMPLE_FIDUCIAL_DES_Y1 = {
+    "lens0_bias": 1.4, "lens1_bias": 1.6, "lens2_bias": 1.6, "lens3_bias": 1.9, "lens4_bias": 2.0,
+    "lens0_delta_z": 0.001, "lens1_delta_z": 0.002, "lens2_delta_z": 0.001, "lens3_delta_z": 0.003,
+    "lens4_delta_z": 0.0,
+    "src0_delta_z": -0.001, "src1_delta_z": -0.019, "src2_delta_z": 0.009, "src3_delta_z": -0.018,
+    "src0_mult_bias": 0.012, "src1_mult_bias": 0.012, "src2_mult_bias": 0.012, "src3_mult_bias": 0.012,
+    "ia_bias": 0.5, "alphaz": 0.0, "z_piv": 0.62,
+}
+
+WL_PER_BIN = ("MultiplicativeShearBiasFactory", "PhotoZShiftFactory", "PhotoZShiftandStretchFactory")
+WL_GLOBAL = ("LinearAlignmentSystematicFactory", "PhotoZShiftFactory", "PhotoZShiftandStretchFactory")
+NC_PER_BIN = ("PhotoZShiftFactory", "PhotoZShiftandStretchFactory", "LinearBiasSystematicFactory",
+              "MagnificationBiasSystematicFactory", "ConstantMagnificationBiasSystematicFactory")
+NC_GLOBAL = ("PhotoZShiftFactory", "PhotoZShiftandStretchFactory")
+_PARAMS_BY_FACTORY = {
+    "MultiplicativeShearBiasFactory": "{tracer}_mult_bias (default 1.0; DES ~0.012)",
+    "PhotoZShiftFactory": "{tracer}_delta_z (0.0)",
+    "PhotoZShiftandStretchFactory": "{tracer}_delta_z (0.0), {tracer}_sigma_z (1.0)",
+    "LinearAlignmentSystematicFactory": "ia_bias (0.5), alphaz (0.0), z_piv (0.5); alphag fixed by ia_alphag",
+    "LinearBiasSystematicFactory": "{tracer}_alphaz (0.0), {tracer}_alphag (0.0), {tracer}_z_piv (0.5) on top of {tracer}_bias",
+    "MagnificationBiasSystematicFactory": "{tracer}_r_lim, _sig_c, _eta, _z_c, _z_m",
+    "ConstantMagnificationBiasSystematicFactory": "{tracer}_mag_bias (1.0)",
+}
+
+DISPATCH_KERNELS = {
+    "firecrown_loglike": {
+        "function": "envkernel.run_in_env", "inner": "firecrown_loglike",
+        "params": {"experiment_yaml": "<path or inline via experiment_yaml_text + sacc_b64/sacc_remote_path>",
+                   "points": [{"Omega_c": 0.25, "sigma8": 0.81, "lens0_bias": 1.4}],
+                   "return_vectors": True, "per_statistic": True},
+        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+        "duration_hint_s": 1800,
+        "returns": "required params with defaults, n_data, per-point loglike/chi2/per-statistic chi2, theory/data vectors",
+    },
+    "firecrown_theory": {
+        "function": "envkernel.run_in_env", "inner": "firecrown_theory",
+        "params": {"experiment_yaml": "<path>", "params": {}, "write_sacc": True, "add_noise": False,
+                   "seed": None, "sacc_output": "theory_realization.hdf5"},
+        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+        "duration_hint_s": 1800,
+        "returns": "theory/data/sigma per statistic and the realization sacc path (job CWD)",
+    },
+    "firecrown_chain": {
+        "function": "envkernel.run_in_env", "inner": "firecrown_chain",
+        "params": {"experiment_yaml": "<path>", "fixed": {}, "priors": {"sigma8": {"min": 0.6, "max": 1.0}},
+                   "max_samples": 2000, "rminus1_stop": 0.05, "work_dir": ".", "chain_prefix": "chain"},
+        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+        "duration_hint_s": 7200,
+        "returns": "Cobaya chain files (job CWD) + weighted means/stds/68% limits per sampled parameter",
+    },
+}
+
+_INLINE_SACC_MAX = 8 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def _exp_path(experiment_yaml: str) -> Path:
+    p = Path(experiment_yaml).expanduser().resolve()
+    if not p.is_file():
+        raise ValueError(f"experiment YAML not found: {p} (create one with firecrown_build_likelihood)")
+    return p
+
+
+def _sacc_path_from_yaml(exp_path: Path) -> Path:
+    import yaml
+
+    with exp_path.open(encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    try:
+        sp = doc["data_source"]["sacc_data_file"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"{exp_path} is not a TwoPointExperiment YAML (no data_source.sacc_data_file)") from exc
+    p = Path(sp)
+    if not p.is_absolute():
+        p = exp_path.parent / p
+    return p
+
+
+def _load_local(exp_path: Path):
+    """(likelihood, tools, sacc) cached per YAML path + mtime via common.get_cached;
+    the inner module's own cache is kept in sync."""
+    from ..inner import firecrown_loglike as inner
+
+    key = f"firecrown_exp_{exp_path}_{exp_path.stat().st_mtime_ns}"
+
+    def _factory():
+        inner._CACHE.pop(str(exp_path), None)
+        return inner.load_experiment(str(exp_path))
+
+    like_tools = get_cached(key, _factory)
+    inner._CACHE[str(exp_path)] = like_tools
+    return like_tools
+
+
+def _remote_params(exp_path: Path, sacc_remote_path: str | None) -> dict:
+    """Ship the YAML (and, unless sacc_remote_path is given, the sacc file) inline."""
+    import base64
+
+    text = exp_path.read_text(encoding="utf-8")
+    out = {"experiment_yaml_text": text}
+    if sacc_remote_path:
+        out["sacc_remote_path"] = sacc_remote_path
+    else:
+        sp = _sacc_path_from_yaml(exp_path)
+        if not sp.is_file():
+            raise ValueError(f"sacc file referenced by {exp_path} not found: {sp}")
+        size = sp.stat().st_size
+        if size > _INLINE_SACC_MAX:
+            raise ValueError(f"{sp.name} is {size / 1e6:.1f} MB (> 8 MB): stage it on the facility yourself "
+                             "and pass sacc_remote_path.")
+        out["sacc_b64"] = base64.b64encode(sp.read_bytes()).decode("ascii")
+        out["sacc_name"] = sp.name
+    return out
+
+
+def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: int,
+               exp_path: Path, sacc_remote_path: str | None = None) -> tuple[dict, str]:
+    """Local in-process call or remote env-kernel; returns (result, computed_on)."""
+    from mcp_server.dispatch import remote_site, run_env_kernel  # lazy: server-only
+
+    site = remote_site()
+    if site:
+        if not env_setup:
+            raise ValueError(
+                f"Dispatch is set to {site}: this call needs env_setup (a shell snippet activating a "
+                "facility environment with firecrown >= 1.14, e.g. the NERSC desc-python stack; see "
+                "export_dispatch_pack's env_setup_candidates).")
+        p = dict(params)
+        p.pop("experiment_yaml", None)
+        p.update(_remote_params(exp_path, sacc_remote_path))
+        res = run_env_kernel(env_setup, inner_name, p, duration=duration)
+        return res["result"]["result"], res.get("host", site)
+    import importlib
+
+    _load_local(exp_path)  # warm/refresh the in-process cache
+    mod = importlib.import_module(f"tools.inner.{inner_name}")
+    # stdout -> stderr: keeps an MCP stdio transport clean without hiding
+    # Cobaya's logging (redirecting into a StringIO makes Cobaya exit silently)
+    with contextlib.redirect_stdout(sys.stderr):
+        return mod.main(dict(params, experiment_yaml=str(exp_path))), "local"
+
+
+# firecrown's internal defaults for some nuisance parameters are NOT "no
+# systematic" (MultiplicativeShearBias defaults to 1.0, i.e. shear x2; the NLA
+# amplitude ia_bias to 0.5). Unspecified parameters matching these suffixes
+# therefore take physically neutral values instead, so "evaluate at the
+# cosmology" means what it says. Galaxy bias ({tracer}_bias) keeps firecrown's
+# 1.5 - zero would be unphysical - and is reported as a firecrown default.
+NEUTRAL_NUISANCE = {"_mult_bias": 0.0, "ia_bias": 0.0, "_delta_z": 0.0, "_sigma_z": 1.0}
+
+
+def _neutral_value(name: str):
+    if name == "ia_bias":
+        return 0.0
+    for suffix, value in NEUTRAL_NUISANCE.items():
+        if suffix.startswith("_") and name.endswith(suffix):
+            return value
+    return None
+
+
+def _experiment_modelling(exp_path) -> dict:
+    try:
+        import yaml
+        doc = yaml.safe_load(pathlib.Path(exp_path).read_text(encoding="utf-8")) or {}
+        return dict((doc.get("ccl_factory") or {}))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _check_point(required: dict, cosmology: CosmologyParams | None, nuisance: dict,
+                 exp_path=None) -> tuple[dict, list[str]]:
+    """Merge cosmology + nuisance into one override dict; return (point, warnings)."""
+    spec = cosmology or CosmologyParams()
+    point = dict(spec.firecrown_params())
+    warnings = []
+    if exp_path is not None:
+        fac = _experiment_modelling(exp_path)
+        exp_tf = fac.get("pure_ccl_transfer_function", "boltzmann_camb")
+        if spec.transfer_function != exp_tf:
+            warnings.append(
+                f"transfer_function: the experiment was built with '{exp_tf}' (fixed in the "
+                f"experiment YAML) and that is what firecrown uses; the cosmology's "
+                f"'{spec.transfer_function}' is ignored. Rebuild with "
+                f"firecrown_build_likelihood(transfer_function='{spec.transfer_function}') to match.")
+        if spec.matter_power_spectrum != "halofit" or spec.baryons != "none" or spec.mg_mu0 or spec.mg_sigma0:
+            warnings.append("firecrown (pure-CCL mode) uses halofit without baryons/MG here; the "
+                            "cosmology's matter_power_spectrum/baryons/MG switches are ignored.")
+    if "sigma8" in point and "sigma8" not in required and "A_s" in required:
+        raise ValueError("this experiment uses amplitude_parameter A_s but the cosmology gives sigma8; "
+                         "pass cosmology={'A_s': ..., 'sigma8': None} or rebuild with amplitude_parameter='sigma8'.")
+    if "A_s" in point and "A_s" not in required and "sigma8" in required:
+        raise ValueError("this experiment uses amplitude_parameter sigma8 but the cosmology gives A_s; "
+                         "pass sigma8 or rebuild with amplitude_parameter='A_s'.")
+    for k, v in as_float_dict(nuisance or {}).items():
+        point[k] = v
+    unknown = sorted(k for k in point if k not in required)
+    if unknown:
+        warnings.append(f"ignored parameters not used by this likelihood: {unknown}")
+        for k in unknown:
+            point.pop(k)
+    missing = sorted(k for k in required if k not in point)
+    neutral = {}
+    for k in missing:
+        v = _neutral_value(k)
+        if v is not None:
+            point[k] = v
+            neutral[k] = v
+    if neutral:
+        warnings.append(f"neutral defaults applied (no systematic): {neutral}")
+    rest = [k for k in missing if k not in neutral]
+    if rest:
+        warnings.append(f"using firecrown defaults for: {rest}")
+    return point, warnings
+
+
+def _plot_theory_vs_data(path: Path, stats: list[dict], title: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from ..plotting import PALETTE, rc_params
+
+    by_type: dict[str, list[dict]] = {}
+    for st in stats:
+        by_type.setdefault(st["data_type"], []).append(st)
+    n_types = len(by_type)
+    max_panels = max(len(v) for v in by_type.values())
+    ncol = min(max_panels, 5)
+    rows_per_type = [int(np.ceil(len(v) / ncol)) for v in by_type.values()]
+    nrow = sum(rows_per_type)
+    with plt.rc_context(rc_params(10)):
+        fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol + 1, 2.2 * nrow + 0.8),
+                                 squeeze=False, constrained_layout=True)
+        for ax in axes.ravel():
+            ax.set_visible(False)
+        r0 = 0
+        for (dtype, group), nr in zip(by_type.items(), rows_per_type):
+            for j, st in enumerate(group):
+                ax = axes[r0 + j // ncol, j % ncol]
+                ax.set_visible(True)
+                x = np.asarray(st["x"], float)
+                th = np.asarray(st["theory"], float)
+                d = np.asarray(st["data"], float)
+                sg = np.asarray(st["sigma"], float)
+                ax.errorbar(x, d, yerr=sg, fmt="o", ms=2.5, color=PALETTE[0], lw=0.8, label="data")
+                ax.plot(x, th, "-", color=PALETTE[1], label="theory")
+                ax.set_xscale("log")
+                if np.all(th > 0) and np.all(d[np.isfinite(d)] > 0):
+                    ax.set_yscale("log")
+                ax.set_title(f"{dtype.replace('galaxy_', '')}: {st['tracer1']}-{st['tracer2']}", fontsize=8)
+                ax.set_xlabel(r"$\theta$ [arcmin]" if st["x_name"] == "theta_arcmin" else r"$\ell$", fontsize=8)
+                ax.tick_params(labelsize=7)
+            r0 += nr
+        axes[0, 0].legend(fontsize=7, loc="best")
+        fig.suptitle(title, fontsize=10)
+        fig.savefig(path)
+        plt.close(fig)
+    _ = n_types
+
+
+# --------------------------------------------------------------------------
+# tools
+# --------------------------------------------------------------------------
+@validate_call
+def firecrown_list_examples() -> ArtifactResult:
+    """List firecrown's maintained examples (`firecrown examples` CLI), the offline test data vector, and the parameter-name conventions.
+
+    Use the offline file (firecrown/tests/sacc_data.hdf5 in the firecrown
+    clone: DES-Y1-like 3x2pt, real space, tracers src0-3 / lens0-4, 457
+    points, dense covariance) for any demo: it needs no download. Example
+    nuisance fiducials for it are in metadata.des_y1_fiducial (biases,
+    delta_z, mult_bias, IA). Then: firecrown_build_likelihood ->
+    firecrown_compute_loglike -> firecrown_scan_loglike.
+    """
+    examples = {
+        "cosmic_shear": {"data": "synthetic (generated with pyccl, offline)", "space": "harmonic",
+                         "statistics": "galaxy_shear_cl_ee for all pairs of trc{i} Gaussian n(z) bins",
+                         "systematics": "PhotoZShift per bin", "params": "trc{i}_delta_z",
+                         "cli": "firecrown examples cosmic_shear OUT --n-bins 2 --ell-min 10 --ell-max 10000"},
+        "cmb_cross": {"data": "synthetic NZ + CMB-lensing Map tracer (z_lss 1100), offline", "space": "harmonic",
+                      "statistics": "galaxy_shear_cl_ee + cmbGalaxy_convergenceShear_cl_e ...",
+                      "systematics": "PhotoZShift per bin", "params": "trc{i}_delta_z"},
+        "sn_srd": {"data": "download srd-y1.sacc (firecrown GitHub release files-v1.0.0)", "space": "n/a",
+                   "statistics": "Supernova distance moduli (tracer sn_ddf_sample)", "params": "sn_ddf_sample_M (~-19.4)",
+                   "note": "uses amplitude_parameter A_s, no P(k) needed"},
+        "des_y1_3x2pt": {"data": "download des_y1_3x2pt.sacc (release files-v1.1.0): real DES Y1 3x2pt, 457 points",
+                         "space": "real", "statistics": "xi+ (10), xi- (10), gamma_t (20), w(theta) (5) over src0-3 / lens0-4",
+                         "systematics": "WL: MultiplicativeShearBias + PhotoZShift per bin, LinearAlignment global; "
+                                        "NC: PhotoZShift per bin (+ bias)",
+                         "params": "ia_bias alphaz z_piv lens{i}_bias lens{i}_delta_z src{i}_delta_z src{i}_mult_bias",
+                         "factory_types": "standard|pt|tatt|hmia|pk_modifier|yaml_default|yaml_pure_ccl|yaml_mu_sigma"},
+    }
+    fc = clone_dir("firecrown")
+    test_file = str(fc / "tests" / "sacc_data.hdf5") if fc and (fc / "tests" / "sacc_data.hdf5").is_file() else None
+    try:
+        import firecrown
+        version = firecrown.__version__
+    except Exception:  # noqa: BLE001
+        version = None
+    return ArtifactResult(
+        status="success", files=[],
+        message=(f"4 firecrown examples; offline test data vector: {test_file or 'not available (no firecrown clone)'}. "
+                 f"firecrown {version} installed."),
+        metadata={"examples": examples, "offline_test_sacc": test_file,
+                  "offline_test_description": "DES-Y1-like 3x2pt real space; NZ tracers lens0-4, src0-3 (400 z points); "
+                                              "galaxy_shear_xi_plus 167, xi_minus 60, galaxy_shearDensity_xi_t 176, "
+                                              "galaxy_density_xi 54; dense 457x457 covariance",
+                  "des_y1_fiducial": _EXAMPLE_FIDUCIAL_DES_Y1,
+                  "parameter_conventions": CONVENTIONS["parameter_names"],
+                  "systematics_factories": {"weak_lensing_per_bin": list(WL_PER_BIN), "weak_lensing_global": list(WL_GLOBAL),
+                                            "number_counts_per_bin": list(NC_PER_BIN), "number_counts_global": list(NC_GLOBAL),
+                                            "parameters": _PARAMS_BY_FACTORY},
+                  "firecrown_version": version},
+    )
+
+
+_MEAS_ALIASES = {
+    "shear_e": ["SHEAR_E"], "shear_t": ["SHEAR_T"], "xi_plus": ["PART_OF_XI_PLUS"],
+    "xi_minus": ["PART_OF_XI_MINUS"], "counts": ["COUNTS"], "density": ["COUNTS"],
+}
+
+
+def _measurements(alias: str, space: str) -> list[str]:
+    a = alias.strip()
+    if a.lower() == "shear":
+        return ["SHEAR_E"] if space == "harmonic" else ["PART_OF_XI_PLUS", "PART_OF_XI_MINUS", "SHEAR_T"]
+    if a.lower() in _MEAS_ALIASES:
+        return _MEAS_ALIASES[a.lower()]
+    if a.upper() in ("SHEAR_E", "SHEAR_T", "PART_OF_XI_PLUS", "PART_OF_XI_MINUS", "COUNTS"):
+        return [a.upper()]
+    raise ValueError(f"unknown measurement {alias!r}; use shear|density|shear_e|shear_t|xi_plus|xi_minus|counts")
+
+
+@validate_call
+def firecrown_build_likelihood(
+    output_dir: Annotated[str, Field(min_length=1)],
+    sacc_path: Annotated[str, Field(min_length=1, description="sacc file with src{i}/lens{i} NZ tracers and a covariance (sacc_prepare_for_firecrown / sacc_attach_gaussian_covariance first if needed).")],
+    correlation_space: Annotated[Literal["auto", "real", "harmonic"], Field(description="'auto' detects from the data types (xi -> real, cl -> harmonic).")] = "auto",
+    wl_per_bin: Annotated[list[str], Field(description=f"Per-bin weak-lensing systematics factories: {WL_PER_BIN}.")] = ["MultiplicativeShearBiasFactory", "PhotoZShiftFactory"],
+    wl_global: Annotated[list[str], Field(description=f"Global weak-lensing systematics: {WL_GLOBAL} (LinearAlignment = NLA IA with ia_bias, alphaz, z_piv).")] = ["LinearAlignmentSystematicFactory"],
+    nc_per_bin: Annotated[list[str], Field(description=f"Per-bin number-counts systematics: {NC_PER_BIN} ({{tracer}}_bias is always present).")] = ["PhotoZShiftFactory"],
+    nc_global: Annotated[list[str], Field(description=f"Global number-counts systematics: {NC_GLOBAL}.")] = [],
+    include_rsd: Annotated[bool, Field(description="Redshift-space distortions in the number-counts tracer.")] = False,
+    ia_alphag: Annotated[float | None, Field(description="Fixed growth exponent alphag of the linear-alignment model (1.0 = DES/firecrown default); None makes it a free parameter 'alphag'.")] = 1.0,
+    require_nonlinear_pk: Annotated[bool, Field(description="Use the nonlinear P(k) (halofit); required for 3x2pt.")] = True,
+    amplitude_parameter: Annotated[Literal["sigma8", "A_s"], Field(description="Which amplitude parameter the likelihood samples.")] = "sigma8",
+    transfer_function: Literal["boltzmann_camb", "bbks", "eisenstein_hu", "eisenstein_hu_nowiggles", "boltzmann_class"] = "boltzmann_camb",
+    scale_cuts: Annotated[list[dict] | None, Field(description="Keep-ranges per tracer: [{'tracer': 'src0', 'measurement': 'shear', 'lower': 10, 'upper': 250}] (theta arcmin or ell). measurement: shear|density|shear_e|shear_t|xi_plus|xi_minus|counts; optional 'tracer2'/'measurement2' restrict to one pair. Points outside [lower, upper] are dropped.")] = None,
+    allow_empty_bins: Annotated[bool, Field(description="Allow a scale cut to remove an entire tracer pair (default True).")] = True,
+    name: Annotated[str, Field(min_length=1, description="Stem of the YAML file.")] = "experiment",
+) -> ArtifactResult:
+    """Turn a sacc file + systematics choices into a validated firecrown experiment YAML and list every parameter the likelihood needs.
+
+    Writes <name>_<slug>.yaml (firecrown TwoPointExperiment: data_source
+    with absolute sacc path + optional scale-cut filters, two_point_factory
+    with the systematics factories you name, ccl_factory in pure_ccl_mode)
+    and loads it once to report: n_data (after cuts), the statistics
+    (data type, tracer pair, n points) and metadata.required_parameters -
+    every sampler parameter with its firecrown default. Those names are
+    what firecrown_compute_loglike / scan / chain accept as `nuisance`
+    (cosmology comes from CosmologyParams). Check the defaults: mult_bias
+    defaults to 1.0 and lens bias to 1.5 unless you set them.
+
+    Systematic factories are given by firecrown type name (see
+    firecrown_list_examples metadata.systematics_factories). Not exposed:
+    TATT / PT bias / halo-model IA (need PT or halo-model calculators).
+    """
+    from ..sacc_tools import _load as _load_sacc
+
+    outdir = resolve_outdir(output_dir)
+    spath = Path(sacc_path).expanduser().resolve()
+    s = _load_sacc(str(spath))
+    if s.covariance is None:
+        raise ValueError(f"{spath.name} has no covariance: firecrown's ConstGaussian needs one. Harmonic files: "
+                         "sacc_attach_gaussian_covariance; real-space: TJPCov/augur.")
+    dtypes = s.get_data_types()
+    if not dtypes:
+        raise ValueError("the sacc file has no data points.")
+    detected = "harmonic" if all("_cl" in d for d in dtypes) else "real" if all("_xi" in d for d in dtypes) else "mixed"
+    if correlation_space == "auto":
+        if detected == "mixed":
+            raise ValueError(f"mixed harmonic/real data types {dtypes}: drop one family with "
+                             "sacc_prepare_for_firecrown(keep_data_types=...) or set correlation_space.")
+        correlation_space = detected
+    elif detected not in ("mixed", correlation_space):
+        raise ValueError(f"correlation_space={correlation_space} but the file holds {detected}-space data {dtypes}.")
+    bad = [(f, WL_PER_BIN) for f in wl_per_bin if f not in WL_PER_BIN] + \
+          [(f, WL_GLOBAL) for f in wl_global if f not in WL_GLOBAL] + \
+          [(f, NC_PER_BIN) for f in nc_per_bin if f not in NC_PER_BIN] + \
+          [(f, NC_GLOBAL) for f in nc_global if f not in NC_GLOBAL]
+    if bad:
+        raise ValueError("unknown/unsupported systematics factory " +
+                         "; ".join(f"{f!r} (allowed: {list(ok)})" for f, ok in bad))
+    tracer_names = list(s.tracers)
+    has_shear = any(d.startswith("galaxy_shear") for d in dtypes)
+    has_density = any(d.startswith("galaxy_density") or "Density" in d for d in dtypes)
+
+    def _sys(f):
+        if f == "LinearAlignmentSystematicFactory":
+            return {"type": f, "alphag": ia_alphag}
+        return {"type": f}
+
+    exp: dict = {
+        "data_source": {"sacc_data_file": str(spath)},
+        "two_point_factory": {
+            "correlation_space": correlation_space,
+            "weak_lensing_factories": ([{"type_source": "default", "per_bin_systematics": [_sys(f) for f in wl_per_bin],
+                                         "global_systematics": [_sys(f) for f in wl_global]}] if has_shear else []),
+            "number_counts_factories": ([{"type_source": "default", "per_bin_systematics": [_sys(f) for f in nc_per_bin],
+                                          "global_systematics": [_sys(f) for f in nc_global],
+                                          "include_rsd": include_rsd}] if has_density else []),
+        },
+        "ccl_factory": {"creation_mode": "pure_ccl_mode", "require_nonlinear_pk": require_nonlinear_pk,
+                        "amplitude_parameter": amplitude_parameter,
+                        "pure_ccl_transfer_function": transfer_function},
+    }
+    cuts_applied = []
+    if scale_cuts:
+        filters = []
+        for c in scale_cuts:
+            for key in ("tracer", "measurement", "lower", "upper"):
+                if key not in c:
+                    raise ValueError(f"scale cut {c} needs keys tracer, measurement, lower, upper")
+            if c["tracer"] not in tracer_names:
+                raise ValueError(f"scale cut tracer {c['tracer']!r} not in file; tracers: {tracer_names}")
+            lo, hi = float(c["lower"]), float(c["upper"])
+            if not lo < hi:
+                raise ValueError(f"scale cut {c}: lower must be < upper")
+            m1 = _measurements(str(c["measurement"]), correlation_space)
+            if "tracer2" in c:
+                if c["tracer2"] not in tracer_names:
+                    raise ValueError(f"scale cut tracer2 {c['tracer2']!r} not in file")
+                m2 = _measurements(str(c.get("measurement2", "density")), correlation_space)
+                for a in m1:
+                    for b in m2:
+                        filters.append({"spec": [{"name": c["tracer"], "measurement": {"subject": "Galaxies", "property": a}},
+                                                 {"name": c["tracer2"], "measurement": {"subject": "Galaxies", "property": b}}],
+                                        "interval": [lo, hi], "method": "support"})
+            else:
+                for a in m1:
+                    filters.append({"spec": [{"name": c["tracer"], "measurement": {"subject": "Galaxies", "property": a}}],
+                                    "interval": [lo, hi], "method": "support"})
+            cuts_applied.append({"tracer": c["tracer"], "measurements": m1, "tracer2": c.get("tracer2"),
+                                 "keep": [lo, hi]})
+        exp["data_source"]["filters"] = {"require_filter_for_all": False, "allow_empty": allow_empty_bins,
+                                         "filters": filters}
+
+    import yaml
+
+    slug = param_slug({"sacc": str(spath), "exp": repr(exp)})
+    ypath = outdir / f"{name}_{slug}.yaml"
+    ypath.write_text(yaml.safe_dump(exp, sort_keys=False), encoding="utf-8")
+
+    # validate by loading (pydantic strict) and building the likelihood once
+    try:
+        like, tools, _ = _load_local(ypath)
+    except Exception as exc:
+        ypath.unlink(missing_ok=True)
+        raise ValueError(f"firecrown rejected the experiment: {type(exc).__name__}: {exc}") from exc
+    from ..inner import firecrown_loglike as inner
+
+    required = inner.required_defaults(like, tools)
+    layout = inner.statistic_layout(like, _load_local(ypath)[2])
+    n_data = int(sum(st["n"] for st in layout))
+    n_total = len(s.data)
+    stats = [{"data_type": st["data_type"], "tracer1": st["tracer1"], "tracer2": st["tracer2"], "n": st["n"]}
+             for st in layout]
+    cosmo_keys = [k for k in required if k in ("Omega_c", "Omega_b", "h", "n_s", "sigma8", "A_s", "Omega_k",
+                                                "Neff", "m_nu", "w0", "wa", "T_CMB")]
+    nuis = {k: v for k, v in required.items() if k not in cosmo_keys}
+    jpath = outdir / f"{name}_{slug}_params.json"
+    write_json(jpath, {"experiment_yaml": str(ypath), "required_parameters": required,
+                       "cosmology_parameters": cosmo_keys, "nuisance_parameters": nuis,
+                       "n_data": n_data, "statistics": stats})
+    return ArtifactResult(
+        status="success", files=[str(ypath), str(jpath)],
+        message=(f"Experiment YAML {ypath.name}: {correlation_space} space, {len(stats)} statistics, n_data={n_data}"
+                 + (f" (of {n_total} after scale cuts)" if n_data != n_total else "")
+                 + f"; {len(required)} parameters required ({len(cosmo_keys)} cosmology + {len(nuis)} nuisance). "
+                 "Pass nuisance values to firecrown_compute_loglike; defaults listed in metadata.required_parameters."),
+        metadata={"experiment_yaml": str(ypath), "sacc_path": str(spath), "correlation_space": correlation_space,
+                  "n_data": n_data, "n_data_total": n_total, "statistics": stats,
+                  "required_parameters": required, "cosmology_parameters": cosmo_keys,
+                  "nuisance_parameters": nuis, "scale_cuts": cuts_applied,
+                  "systematics": {"wl_per_bin": wl_per_bin, "wl_global": wl_global, "nc_per_bin": nc_per_bin,
+                                  "nc_global": nc_global, "parameters_by_factory": _PARAMS_BY_FACTORY},
+                  "ccl_factory": exp["ccl_factory"]},
+    )
+
+
+@validate_call
+def firecrown_compute_loglike(
+    output_dir: Annotated[str, Field(min_length=1)],
+    experiment_yaml: Annotated[str, Field(min_length=1, description="From firecrown_build_likelihood.")],
+    cosmology: Annotated[CosmologyParams | None, Field(description="Cosmology (None = vanilla LCDM: Omega_c 0.25, Omega_b 0.05, h 0.67, n_s 0.96, sigma8 0.81).")] = None,
+    nuisance: Annotated[dict[str, float], Field(description="Nuisance values by firecrown name (lens0_bias, src0_delta_z, src0_mult_bias, ia_bias, ...); unspecified mult_bias/ia_bias/delta_z take NEUTRAL values (0; no systematic), other unspecified ones firecrown's defaults (e.g. {tracer}_bias 1.5) - see metadata.warnings.")] = {},
+    plot: Annotated[bool, Field(description="Write a theory-vs-data PNG per statistic.")] = True,
+    env_setup: Annotated[str | None, Field(description="Only when dispatch is remote: facility environment activation snippet.")] = None,
+    sacc_remote_path: Annotated[str | None, Field(description="Remote runs only: facility path of the sacc file (else it is shipped inline).")] = None,
+) -> ArtifactResult:
+    """Evaluate the firecrown log-likelihood, chi2 and per-statistic chi2 of an experiment at one cosmology + nuisance point.
+
+    Returns loglike (= -chi2/2 for ConstGaussian), chi2, n_data, chi2/n_data
+    (expect ~1 at a good fit; the DES-Y1-like test file at the example
+    fiducials gives chi2/n ~ 1.2), per-statistic contributions (chi2_block:
+    chi2 of that statistic alone with its own covariance block; chi2_share:
+    r_i (C^-1 r)_i summed over the block, sums to the total), the list of
+    parameters that fell back to defaults, and unused_keys (names you
+    passed that the likelihood does not have - a typo detector). Files:
+    theory_vs_data_<slug>.csv (statistic, tracers, x, data, theory, sigma,
+    pull) and the PNG. Evaluation ~0.4 s for DES-Y1 3x2pt; always local
+    unless dispatch is set. Next: firecrown_scan_loglike to profile one
+    parameter, firecrown_run_chain for posteriors.
+    """
+    exp_path = _exp_path(experiment_yaml)
+    outdir = resolve_outdir(output_dir)
+    like, tools, _ = _load_local(exp_path)
+    from ..inner import firecrown_loglike as inner
+
+    required = inner.required_defaults(like, tools)
+    point, warns = _check_point(required, cosmology, nuisance, exp_path)
+    res, computed_on = _run_inner("firecrown_loglike",
+                                  {"points": [point], "return_vectors": True, "per_statistic": True},
+                                  env_setup, 1800, exp_path, sacc_remote_path)
+    r = res["results"][0]
+    if r.get("error") and r.get("loglike") is None:
+        raise RuntimeError(f"likelihood evaluation failed: {r['error']}")
+    n_data = res["n_data"]
+    spec = cosmology or CosmologyParams()
+    slug = param_slug({"cosmo": spec.slug(), "nuis": repr(sorted(nuisance.items())), "exp": str(exp_path)})
+
+    # per-point CSV
+    stats = res["statistics"]
+    pos = 0
+    cols = {"statistic_index": [], "x": [], "data": [], "theory": [], "sigma": [], "pull": []}
+    rows_meta = []
+    for i, st in enumerate(stats):
+        n = st["n"]
+        th = np.asarray(r["theory"][pos:pos + n])
+        d = np.asarray(r["data"][pos:pos + n])
+        sg = np.asarray(r["sigma"][pos:pos + n])
+        cols["statistic_index"] += [i] * n
+        cols["x"] += list(st["x"])
+        cols["data"] += d.tolist()
+        cols["theory"] += th.tolist()
+        cols["sigma"] += sg.tolist()
+        cols["pull"] += ((d - th) / np.where(sg > 0, sg, np.nan)).tolist()
+        rows_meta.append(f"{i}: {st['data_type']} {st['tracer1']}-{st['tracer2']} ({st['x_name']}, n={n})")
+        st["theory"], st["data"], st["sigma"] = th.tolist(), d.tolist(), sg.tolist()
+        pos += n
+    cpath = outdir / f"theory_vs_data_{slug}.csv"
+    write_csv(cpath, {k: np.asarray(v, float) for k, v in cols.items()},
+              [f"label: theory vs data ({spec.label()})", "quantity: theory_vs_data",
+               f"experiment: {exp_path}", f"loglike: {r['loglike']}", f"chi2: {r['chi2']}", f"n_data: {n_data}",
+               "x: theta in arcmin (real) or ell (harmonic); pull = (data - theory)/sigma",
+               "statistics: " + " | ".join(rows_meta)])
+    files = [str(cpath)]
+    if plot:
+        ppath = outdir / f"theory_vs_data_{slug}.png"
+        _plot_theory_vs_data(ppath, stats, f"{exp_path.stem}: chi2={r['chi2']:.1f}/{n_data} ({spec.label()})")
+        files.append(str(ppath))
+    per_stat = r.get("per_statistic", [])
+    worst = sorted(per_stat, key=lambda p: -(p["chi2_block"] or 0) / max(p["n"], 1))[:5]
+    pulls = np.asarray(cols["pull"], float)
+    pulls = pulls[np.isfinite(pulls)]
+    msg = (f"loglike = {r['loglike']:.3f}, chi2 = {r['chi2']:.2f} for n_data = {n_data} "
+           f"(chi2/n = {r['chi2'] / n_data:.3f}) at {spec.label()}"
+           + (f", on {computed_on}" if computed_on != "local" else "") + ". "
+           + (f"Worst statistics by chi2_block/n: " + ", ".join(
+               f"{w['data_type'].replace('galaxy_', '')} {w['tracer1']}-{w['tracer2']} ({w['chi2_block']:.1f}/{w['n']})"
+               for w in worst) + ". " if worst else "")
+           + (" ".join(warns) if warns else ""))
+    return ArtifactResult(
+        status="success", files=files, message=msg,
+        metadata={"loglike": r["loglike"], "chi2": r["chi2"], "n_data": n_data, "chi2_per_dof": r["chi2"] / n_data,
+                  "per_statistic": per_stat, "point": point, "warnings": warns,
+                  "unused_keys": r.get("unused_keys", []), "unknown_keys": r.get("unknown_keys", []),
+                  "required_parameters": required, "max_abs_pull": float(np.abs(pulls).max()) if pulls.size else None,
+                  "rms_pull": float(np.sqrt(np.mean(pulls ** 2))) if pulls.size else None,
+                  "computed_on": computed_on, "firecrown_version": res.get("firecrown_version"),
+                  "experiment_yaml": str(exp_path), "cosmology": spec.firecrown_params()},
+    )
+
+
+@validate_call
+def firecrown_theory_data_vector(
+    output_dir: Annotated[str, Field(min_length=1)],
+    experiment_yaml: Annotated[str, Field(min_length=1)],
+    cosmology: CosmologyParams | None = None,
+    nuisance: Annotated[dict[str, float], Field(description="Nuisance values by firecrown name.")] = {},
+    write_sacc: Annotated[bool, Field(description="Write a sacc copy whose data vector is the theory (or a noisy draw).")] = True,
+    add_noise: Annotated[bool, Field(description="Draw the realization from the covariance (Cholesky) instead of the noiseless theory.")] = False,
+    seed: Annotated[int | None, Field(ge=0, description="Seed for the noisy draw.")] = None,
+    output_format: Literal["hdf5", "fits"] = "hdf5",
+    plot: bool = True,
+    env_setup: str | None = None,
+    sacc_remote_path: str | None = None,
+) -> ArtifactResult:
+    """Compute the theory data vector of an experiment and optionally write it as a new (noiseless or noisy) sacc realization.
+
+    Uses firecrown's make_realization: a copy of the experiment's sacc with
+    the modelled points replaced by theory (add_noise=False: a synthetic
+    noiseless data vector - the standard forecast input) or by theory +
+    Cholesky(C) N(0,1) (add_noise=True; set seed for reproducibility).
+    Points removed by scale cuts keep their original data (strict=False).
+    Files: theory_vector_<slug>.csv (statistic_index, x, theory, data,
+    sigma), the sacc (<name>_theory|noisy_<slug>.hdf5|fits) and a PNG.
+    Feed the sacc back to firecrown_build_likelihood to check that the
+    likelihood recovers chi2 = 0 (noiseless) or ~n_data (noisy) - the
+    standard closure test.
+    """
+    exp_path = _exp_path(experiment_yaml)
+    outdir = resolve_outdir(output_dir)
+    like, tools, _ = _load_local(exp_path)
+    from ..inner import firecrown_loglike as inner
+
+    required = inner.required_defaults(like, tools)
+    point, warns = _check_point(required, cosmology, nuisance, exp_path)
+    spec = cosmology or CosmologyParams()
+    slug = param_slug({"cosmo": spec.slug(), "nuis": repr(sorted(nuisance.items())), "exp": str(exp_path),
+                       "noise": add_noise, "seed": seed})
+    tag = "noisy" if add_noise else "theory"
+    sacc_out = outdir / f"{exp_path.stem}_{tag}_{slug}.{'fits' if output_format == 'fits' else 'hdf5'}"
+    params = {"params": point, "write_sacc": write_sacc, "add_noise": add_noise, "seed": seed,
+              "sacc_output": str(sacc_out) if write_sacc else None, "strict": False}
+    from mcp_server.dispatch import remote_site
+
+    if remote_site() and write_sacc:
+        params["sacc_output"] = sacc_out.name  # job CWD; fetched back as an artifact
+    res, computed_on = _run_inner("firecrown_theory", params, env_setup, 1800, exp_path, sacc_remote_path)
+    if res.get("error"):
+        raise RuntimeError(f"theory evaluation failed: {res['error']}")
+    stats = res["statistics"]
+    cols = {"statistic_index": [], "x": [], "theory": [], "data": [], "sigma": []}
+    rows_meta = []
+    for i, st in enumerate(stats):
+        cols["statistic_index"] += [i] * st["n"]
+        cols["x"] += list(st["x"])
+        cols["theory"] += list(st["theory"])
+        cols["data"] += list(st["data"])
+        cols["sigma"] += list(st["sigma"])
+        rows_meta.append(f"{i}: {st['data_type']} {st['tracer1']}-{st['tracer2']} ({st['x_name']}, n={st['n']})")
+    cpath = outdir / f"theory_vector_{slug}.csv"
+    write_csv(cpath, {k: np.asarray(v, float) for k, v in cols.items()},
+              [f"label: theory vector ({spec.label()})", "quantity: theory_vector", f"experiment: {exp_path}",
+               f"loglike_at_point: {res['loglike']}", f"chi2_at_point: {res['chi2']}",
+               "statistics: " + " | ".join(rows_meta)])
+    files = [str(cpath)]
+    sacc_file = res.get("sacc_file")
+    if write_sacc and sacc_file and Path(sacc_file).is_file():
+        files.append(str(Path(sacc_file).resolve()))
+    elif write_sacc and sacc_out.is_file():
+        files.append(str(sacc_out))
+        sacc_file = str(sacc_out)
+    if plot:
+        ppath = outdir / f"theory_vector_{slug}.png"
+        _plot_theory_vs_data(ppath, stats, f"{exp_path.stem}: theory ({spec.label()})")
+        files.append(str(ppath))
+    th = np.asarray(cols["theory"], float)
+    return ArtifactResult(
+        status="success", files=files,
+        message=(f"Theory vector of {res['n_data']} points at {spec.label()} (chi2 vs the file's data = {res['chi2']:.1f})"
+                 + (f"; wrote {tag} realization sacc {Path(sacc_file).name}" if sacc_file else "")
+                 + (f", on {computed_on}" if computed_on != "local" else "") + ". " + " ".join(warns)),
+        metadata={"n_data": res["n_data"], "loglike_at_point": res["loglike"], "chi2_at_point": res["chi2"],
+                  "sacc_file": sacc_file, "add_noise": add_noise, "seed": seed, "point": point, "warnings": warns,
+                  "theory_min": float(th.min()), "theory_max": float(th.max()),
+                  "statistics": [{k: st[k] for k in ("data_type", "tracer1", "tracer2", "n")} for st in stats],
+                  "computed_on": computed_on, "experiment_yaml": str(exp_path)},
+    )
+
+
+def _one_sigma_crossings(x: np.ndarray, dchi2: np.ndarray) -> tuple[float | None, float | None]:
+    """Where delta chi2 crosses 1 on each side of the minimum (linear interpolation)."""
+    i0 = int(np.nanargmin(dchi2))
+    lo = hi = None
+    for i in range(i0, 0, -1):
+        if dchi2[i - 1] >= 1.0 > dchi2[i]:
+            lo = float(x[i] + (1.0 - dchi2[i]) * (x[i - 1] - x[i]) / (dchi2[i - 1] - dchi2[i]))
+            break
+    for i in range(i0, len(x) - 1):
+        if dchi2[i + 1] >= 1.0 > dchi2[i]:
+            hi = float(x[i] + (1.0 - dchi2[i]) * (x[i + 1] - x[i]) / (dchi2[i + 1] - dchi2[i]))
+            break
+    return lo, hi
+
+
+@validate_call
+def firecrown_scan_loglike(
+    output_dir: Annotated[str, Field(min_length=1)],
+    experiment_yaml: Annotated[str, Field(min_length=1)],
+    parameter: Annotated[str, Field(min_length=1, description="Parameter to profile (any required name: sigma8, Omega_c, w0, lens0_bias, ia_bias, ...).")],
+    values: Annotated[list[float] | None, Field(description="Explicit grid; or give min/max/n_points.")] = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    n_points: Annotated[int, Field(ge=3, le=200)] = 11,
+    cosmology: Annotated[CosmologyParams | None, Field(description="Fixed cosmology for the other parameters.")] = None,
+    nuisance: Annotated[dict[str, float], Field(description="Fixed nuisance values.")] = {},
+    plot: bool = True,
+    env_setup: str | None = None,
+    sacc_remote_path: str | None = None,
+) -> ArtifactResult:
+    """Profile the log-likelihood along one parameter (all others fixed) and report the chi2 minimum and 1-sigma crossing.
+
+    Writes scan_<param>_<slug>.csv (value, loglike, chi2, delta_chi2) and a
+    PNG of delta chi2 with the delta chi2 = 1 line. metadata gives the
+    grid minimum, a parabolic refinement of the best value and sigma, and
+    the delta chi2 = 1 crossings (None when the grid does not bracket
+    them: widen the range). This is a conditional (not marginalised)
+    profile - the sanity check to run BEFORE any chain: the fiducial
+    should sit near the minimum and the curvature should be reasonable.
+    Each point is one likelihood evaluation (~0.4 s for DES-Y1 3x2pt);
+    dispatchable with env_setup when a remote site is set.
+    """
+    exp_path = _exp_path(experiment_yaml)
+    outdir = resolve_outdir(output_dir)
+    like, tools, _ = _load_local(exp_path)
+    from ..inner import firecrown_loglike as inner
+
+    required = inner.required_defaults(like, tools)
+    if parameter not in required:
+        raise ValueError(f"{parameter!r} is not a parameter of this likelihood; required: {sorted(required)}")
+    if values is None:
+        if min_value is None or max_value is None:
+            raise ValueError("give either values=[...] or min_value/max_value (+ n_points).")
+        if not min_value < max_value:
+            raise ValueError("min_value must be < max_value.")
+        grid = np.linspace(min_value, max_value, n_points)
+    else:
+        grid = np.asarray(sorted(set(float(v) for v in values)), float)
+        if len(grid) < 3:
+            raise ValueError("values needs at least 3 distinct entries.")
+    point, warns = _check_point(required, cosmology, nuisance, exp_path)
+    points = [dict(point, **{parameter: float(v)}) for v in grid]
+    res, computed_on = _run_inner("firecrown_loglike",
+                                  {"points": points, "return_vectors": False, "per_statistic": False},
+                                  env_setup, 3600, exp_path, sacc_remote_path)
+    ll = np.array([r["loglike"] if r["loglike"] is not None else np.nan for r in res["results"]], float)
+    chi2 = np.array([r["chi2"] if r["chi2"] is not None else np.nan for r in res["results"]], float)
+    errors = [(float(v), r["error"]) for v, r in zip(grid, res["results"]) if r.get("error")]
+    if not np.isfinite(chi2).any():
+        raise RuntimeError(f"no finite likelihood on the grid; first error: {errors[0] if errors else 'unknown'}")
+    dchi2 = chi2 - np.nanmin(chi2)
+    i0 = int(np.nanargmin(chi2))
+    lo, hi = _one_sigma_crossings(grid, dchi2)
+    # parabolic refinement around the minimum
+    best_fit = {"value": float(grid[i0]), "sigma": None}
+    if 0 < i0 < len(grid) - 1 and np.isfinite(chi2[i0 - 1:i0 + 2]).all():
+        a, b, _c = np.polyfit(grid[i0 - 1:i0 + 2], chi2[i0 - 1:i0 + 2], 2)
+        if a > 0:
+            best_fit = {"value": float(-b / (2 * a)), "sigma": float(1.0 / np.sqrt(a))}
+    spec = cosmology or CosmologyParams()
+    slug = param_slug({"p": parameter, "grid": grid.tolist(), "cosmo": spec.slug(),
+                       "nuis": repr(sorted(nuisance.items())), "exp": str(exp_path)})
+    cpath = outdir / f"scan_{parameter}_{slug}.csv"
+    write_csv(cpath, {parameter: grid, "loglike": ll, "chi2": chi2, "delta_chi2": dchi2},
+              [f"label: profile of {parameter} ({spec.label()})", "quantity: loglike_scan",
+               f"experiment: {exp_path}", f"n_data: {res['n_data']}",
+               f"min_chi2: {np.nanmin(chi2)} at {parameter}={grid[i0]}",
+               f"one_sigma_crossings: {lo}, {hi}"])
+    files = [str(cpath)]
+    if plot:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        from ..plotting import PALETTE, param_symbol, rc_params
+
+        with plt.rc_context(rc_params()):
+            fig, ax = plt.subplots(figsize=(6.0, 4.2), constrained_layout=True)
+            ax.plot(grid, dchi2, "-o", color=PALETTE[0], ms=4, label=r"$\Delta\chi^2$")
+            ax.axhline(1.0, color=PALETTE[1], ls="--", lw=1.2, label=r"$\Delta\chi^2 = 1$")
+            for v in (lo, hi):
+                if v is not None:
+                    ax.axvline(v, color=PALETTE[2], ls=":", lw=1.0)
+            ax.set_xlabel(param_symbol(parameter))
+            ax.set_ylabel(r"$\Delta\chi^2$")
+            ax.set_ylim(bottom=-0.05 * max(np.nanmax(dchi2), 1.0))
+            ax.set_title(f"{exp_path.stem}: profile of {parameter}", fontsize=11)
+            ax.legend()
+            ppath = outdir / f"scan_{parameter}_{slug}.png"
+            fig.savefig(ppath)
+            plt.close(fig)
+        files.append(str(ppath))
+    sig_txt = (f"1-sigma interval [{lo:.4g}, {hi:.4g}]" if lo is not None and hi is not None else
+               "delta chi2 = 1 not bracketed on both sides (widen the grid)")
+    return ArtifactResult(
+        status="success", files=files,
+        message=(f"Profiled {parameter} over {len(grid)} points [{grid[0]:g}, {grid[-1]:g}]: min chi2 = "
+                 f"{np.nanmin(chi2):.2f} (n_data {res['n_data']}) at {parameter} = {grid[i0]:g}"
+                 + (f" (parabolic best {best_fit['value']:.4g} +/- {best_fit['sigma']:.3g})" if best_fit["sigma"] else "")
+                 + f"; {sig_txt}" + (f"; {len(errors)} failed points" if errors else "")
+                 + (f", on {computed_on}" if computed_on != "local" else "") + ". " + " ".join(warns)),
+        metadata={"parameter": parameter, "grid": grid.tolist(), "loglike": ll.tolist(), "chi2": chi2.tolist(),
+                  "delta_chi2": dchi2.tolist(), "min_chi2": float(np.nanmin(chi2)), "n_data": res["n_data"],
+                  "grid_minimum": float(grid[i0]), "parabolic_best_fit": best_fit,
+                  "one_sigma_lower": lo, "one_sigma_upper": hi, "errors": errors, "warnings": warns,
+                  "fixed_point": point, "computed_on": computed_on, "experiment_yaml": str(exp_path)},
+    )
+
+
+firecrown_scan_loglike.weight = "dispatchable"
+
+
+@validate_call
+def firecrown_run_chain(
+    output_dir: Annotated[str, Field(min_length=1)],
+    experiment_yaml: Annotated[str, Field(min_length=1)],
+    priors: Annotated[dict[str, dict[str, float]], Field(description="Sampled parameters with uniform priors: {'sigma8': {'min': 0.6, 'max': 1.0, 'ref': 0.81, 'proposal': 0.02}, 'Omega_c': {...}} (ref/proposal optional).")],
+    cosmology: Annotated[CosmologyParams | None, Field(description="Fixed values for cosmology parameters that are not sampled.")] = None,
+    nuisance: Annotated[dict[str, float], Field(description="Fixed nuisance values (unsampled ones take firecrown defaults).")] = {},
+    max_samples: Annotated[int, Field(ge=4, le=200000, description="Cobaya mcmc max_samples (accepted steps). Small by default: ~0.4 s per step locally for DES-Y1 3x2pt.")] = 200,
+    rminus1_stop: Annotated[float, Field(gt=0.0, le=1.0, description="Gelman-Rubin R-1 stopping criterion.")] = 0.05,
+    seed: Annotated[int | None, Field(ge=0)] = None,
+    chain_prefix: Annotated[str, Field(min_length=1)] = "chain",
+    plot: Annotated[bool, Field(description="Trace plot of the sampled parameters (needs the chain file locally).")] = True,
+    env_setup: Annotated[str | None, Field(description="Required when dispatch is remote: facility environment activation (must provide firecrown + cobaya).")] = None,
+    sacc_remote_path: str | None = None,
+) -> ArtifactResult:
+    """Run a Cobaya MCMC over a firecrown experiment in pure-CCL mode (no theory block) and summarise the posterior.
+
+    Heavy: each accepted step costs several likelihood evaluations (~0.4 s
+    each for DES-Y1 3x2pt), so the default max_samples=200 is a smoke run
+    (~minutes); real chains need thousands of samples and dispatch to a
+    facility (set_dispatch + env_setup). Cobaya 'mcmc' with uniform
+    priors, proposal = (max-min)/20 unless given, burn_in 0. Writes the
+    Cobaya chain (<prefix>.1.txt, .updated.yaml, .covmat, ...),
+    chain_summary_<slug>.csv (parameter, mean, std, lower68, upper68 from
+    the weighted samples; getdist means/stds when getdist is present) and
+    a trace PNG. metadata.converged / Rminus1 say whether the run reached
+    rminus1_stop (short runs will not: treat them as smoke tests). Run
+    firecrown_scan_loglike first to choose sensible prior ranges.
+    """
+    exp_path = _exp_path(experiment_yaml)
+    outdir = resolve_outdir(output_dir)
+    like, tools, _ = _load_local(exp_path)
+    from ..inner import firecrown_loglike as inner
+
+    required = inner.required_defaults(like, tools)
+    if not priors:
+        raise ValueError("priors must name at least one parameter to sample.")
+    bad = sorted(k for k in priors if k not in required)
+    if bad:
+        raise ValueError(f"priors for parameters the likelihood does not have: {bad}; required: {sorted(required)}")
+    for k, spec_ in priors.items():
+        if "min" not in spec_ or "max" not in spec_ or not spec_["min"] < spec_["max"]:
+            raise ValueError(f"prior for {k} needs min < max: {spec_}")
+    point, warns = _check_point(required, cosmology, nuisance, exp_path)
+    fixed = {k: v for k, v in point.items() if k not in priors}
+    spec = cosmology or CosmologyParams()
+    slug = param_slug({"priors": repr(sorted(priors.items())), "fixed": repr(sorted(fixed.items())),
+                       "n": max_samples, "seed": seed, "exp": str(exp_path)})
+    from mcp_server.dispatch import remote_site
+
+    work_dir = str(outdir) if not remote_site() else "."
+    params = {"fixed": fixed, "priors": {k: as_float_dict(v) for k, v in priors.items()},
+              "max_samples": max_samples, "rminus1_stop": rminus1_stop, "work_dir": work_dir,
+              "chain_prefix": f"{chain_prefix}_{slug}", "seed": seed}
+    res, computed_on = _run_inner("firecrown_chain", params, env_setup,
+                                  max(1800, int(max_samples * 5)), exp_path, sacc_remote_path)
+    summary = res["summary"]
+    names = list(summary)
+    spath = outdir / f"chain_summary_{slug}.csv"
+    write_csv(spath, {"parameter_index": np.arange(len(names), dtype=float),
+                      "mean": np.array([summary[n]["mean"] for n in names]),
+                      "std": np.array([summary[n]["std"] for n in names]),
+                      "lower68": np.array([summary[n]["lower68"] for n in names]),
+                      "upper68": np.array([summary[n]["upper68"] for n in names])},
+              [f"label: Cobaya mcmc summary ({', '.join(names)})", "quantity: chain_summary",
+               f"parameters: {names}", f"experiment: {exp_path}", f"n_samples: {res['n_samples']}",
+               f"acceptance_rate: {res.get('acceptance_rate')}", f"converged: {res.get('converged')}",
+               f"Rminus1: {res.get('Rminus1')}", f"fixed: {fixed}"])
+    files = [str(spath)] + [f for f in res.get("chain_files", []) if Path(f).is_file()]
+    chain_txt = next((f for f in res.get("chain_files", []) if f.endswith(".1.txt") and Path(f).is_file()), None)
+    if plot and chain_txt:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            from ..plotting import PALETTE, param_symbol, rc_params
+
+            with open(chain_txt, encoding="utf-8") as fh:
+                header = fh.readline().lstrip("#").split()
+            arr = np.loadtxt(chain_txt, ndmin=2)
+            colidx = {n: header.index(n) for n in names if n in header}
+            with plt.rc_context(rc_params(10)):
+                fig, axes = plt.subplots(len(colidx), 1, figsize=(6.4, 1.8 * len(colidx) + 0.6),
+                                         squeeze=False, constrained_layout=True, sharex=True)
+                for ax, (n, j) in zip(axes[:, 0], colidx.items()):
+                    ax.plot(np.arange(len(arr)), arr[:, j], "-", color=PALETTE[0], lw=0.9)
+                    ax.axhline(summary[n]["mean"], color=PALETTE[1], ls="--", lw=1.0)
+                    ax.set_ylabel(param_symbol(n))
+                axes[-1, 0].set_xlabel("accepted step")
+                fig.suptitle(f"{exp_path.stem}: Cobaya mcmc trace ({res['n_samples']} samples)", fontsize=10)
+                ppath = outdir / f"chain_trace_{slug}.png"
+                fig.savefig(ppath)
+                plt.close(fig)
+            files.append(str(ppath))
+        except Exception as exc:  # noqa: BLE001 - plotting is best effort
+            warns.append(f"trace plot skipped: {exc}")
+    txt = ", ".join(f"{n} = {summary[n]['mean']:.4g} +/- {summary[n]['std']:.3g}" for n in names)
+    return ArtifactResult(
+        status="success", files=files,
+        message=(f"Cobaya mcmc: {res['n_samples']} accepted samples ({res.get('n_weighted', 0):.0f} weighted), "
+                 f"acceptance {res.get('acceptance_rate') or float('nan'):.2f}, converged={res.get('converged')} "
+                 f"(R-1 = {res.get('Rminus1')}). Posterior means: {txt}."
+                 + (f" Computed on {computed_on}." if computed_on != "local" else "")
+                 + (" Short run: treat as a smoke test, not a converged posterior." if not res.get("converged") else "")
+                 + " " + " ".join(warns)),
+        metadata={"summary": summary, "sampled": names, "fixed": fixed, "n_samples": res["n_samples"],
+                  "n_weighted": res.get("n_weighted"), "acceptance_rate": res.get("acceptance_rate"),
+                  "converged": res.get("converged"), "Rminus1": res.get("Rminus1"), "best_fit": res.get("best_fit"),
+                  "used_getdist": res.get("used_getdist"), "chain_files": res.get("chain_files", []),
+                  "warnings": warns, "computed_on": computed_on, "experiment_yaml": str(exp_path),
+                  "cobaya_settings": {"sampler": "mcmc", "max_samples": max_samples, "rminus1_stop": rminus1_stop,
+                                      "seed": seed, "creation_mode": "pure_ccl_mode"}},
+    )
+
+
+firecrown_run_chain.weight = "heavy"

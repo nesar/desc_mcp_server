@@ -1,0 +1,16 @@
+# upstream DESC package clones (read-only references, never modified here)
+CCL/
+CCLX/
+TXPipe/
+firecrown/
+augur/
+# shallow clones of integration/example repos
+external/
+# local junk
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+output/
+*.bak
+.DS_Store

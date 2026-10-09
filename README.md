@@ -1,0 +1,191 @@
+# desc-mcp-server
+
+MCP server exposing the public **LSST DESC** cosmology stack as agent tools:
+[CCL](https://github.com/LSSTDESC/CCL) theory predictions,
+[sacc](https://github.com/LSSTDESC/sacc) data vectors,
+[firecrown](https://github.com/LSSTDESC/firecrown) likelihoods,
+[augur](https://github.com/LSSTDESC/augur) Fisher forecasts, and
+[TXPipe](https://github.com/LSSTDESC/TXPipe) measurement pipelines — 43
+tools in seven families, with server-side skills for the multi-tool pipelines
+and optional execution of the heavy steps on ALCF Polaris / NERSC Perlmutter
+through the [hep-genesis](https://github.com/HEP-KE/hep-genesis-agent)
+dispatch engine.
+
+The upstream packages are used **unmodified** (they are read-only reference
+clones next to this repo); every line of glue lives here, so the DESC codes
+can keep evolving underneath.
+
+Companion documents:
+- [`ENVIRONMENT.md`](ENVIRONMENT.md) — how the single `desc-mcp` Python
+  environment is assembled, the version pins and why, why TXPipe lives
+  elsewhere, and the facility environments a user can choose
+- [`notes/DESIGN.md`](notes/DESIGN.md) — the design decisions, with the
+  package surveys that back them in `notes/survey_*.md`
+
+## Quick start
+
+```bash
+bash scripts/setup_env.sh                 # creates conda env "desc-mcp" (~3 min, conda-forge only)
+conda activate desc-mcp
+python tests/smoke_env.py                 # 7 environment checks
+python -m pytest tests/ -q                # in-process tool tests
+python tests/smoke_server.py              # every family through a live MCP session
+python -m mcp_server                      # stdio transport
+python -m mcp_server --transport streamable-http --port 8000   # HTTP
+```
+
+Register with Claude Code / Claude Desktop (stdio, local):
+
+```bash
+claude mcp add desc -- $(conda info --base)/envs/desc-mcp/bin/python -m mcp_server
+```
+
+(Claude Desktop: add the same command and args to `claude_desktop_config.json`,
+with `"cwd"` set to this directory.) Or point any MCP client — including the
+hep-genesis-agent desktop app's server list — at the HTTP endpoint
+(`http://host:8000/mcp`).
+
+## Tool families
+
+| Family | Tools | Backed by |
+|---|---|---|
+| meta | `list_desc_packages`, `describe_desc_tool_family`, `list_desc_skills`, `load_desc_skill`, `convert_cosmology_names` | registry + skills + name maps |
+| ccl | `ccl_describe_cosmology`, `ccl_background`, `ccl_matter_pk`, `ccl_lsst_srd_nz`, `ccl_angular_cls`, `ccl_correlation_functions`, `ccl_correlation_3d`, `ccl_halo_mass_function`, `ccl_halo_model_pk`, `ccl_baryon_boost` | pyccl 3.3.6 (+ CAMB, CosmicEmu, bacco, HMcode) |
+| sacc | `sacc_inspect`, `sacc_to_csv`, `sacc_prepare_for_firecrown`, `sacc_attach_gaussian_covariance` | sacc 2.4 (+ pyccl for the Gaussian covariance) |
+| firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain` | firecrown 1.16 factory API, Cobaya (pure-CCL mode) |
+| augur | `augur_list_examples`, `augur_generate_forecast_config`, `augur_validate_forecast_config`, `augur_generate_synthetic_datavector`, `augur_compute_fisher`, `augur_plot_fisher_contours` | augur 1.2.4 (+ TJPCov, numdifftools / derivkit) |
+| txpipe | `txpipe_list_stages`, `txpipe_describe_stage`, `txpipe_list_examples`, `txpipe_generate_pipeline`, `txpipe_validate_pipeline`, `txpipe_run_pipeline`, `txpipe_run_status`, `txpipe_fetch_example_data` | TXPipe source (read as metadata) + ceci; runs in a separate TXPipe env or on a facility |
+| dispatch | `set_dispatch`, `get_dispatch`, `auth_status`, `export_dispatch_pack` | hep-genesis engine (IRI + Globus) |
+
+Conventions every tool follows: redshift `z` at the boundary (never scale
+factor); `k` in h/Mpc and P(k) in (Mpc/h)^3 unless a tool's `k_units` says
+otherwise; `theta` in arcmin; parameter names are firecrown's (`Omega_c`,
+`Omega_b`, `h`, `n_s`, `sigma8` or `A_s`, `w0`, `wa`, `m_nu`; nuisance
+`src0_delta_z`, `lens0_bias`, `ia_bias`, ...). One `cosmology` object (with
+presets `vanilla`, `planck18`, `desc_srd`) is accepted by every family. Files,
+not arrays, flow between tools; every file-writing tool takes `output_dir`
+and returns `{status, files, message, metadata}`.
+
+## Skills (server-side, client-agnostic)
+
+The server carries its own skills — named multi-tool recipes in
+[`skills/`](skills/) (markdown with a small frontmatter header), served both
+through `list_desc_skills` / `load_desc_skill` and as native MCP prompts.
+
+| Skill | What it does |
+|---|---|
+| `desc-tour` | one representative call per family; the five-minute demo path |
+| `ccl-datavector-to-sacc` | SRD n(z) → angular C_ell (Limber / non-Limber) → sacc file ready for firecrown |
+| `pk-ccl-vs-emulators` | CCL nonlinear P(k) across prescriptions vs the companion emulator server, one k grid |
+| `likelihood-sanity-checks` | inspect → build → loglike at fiducial → 1-D scan, with the chi2/dof and parameter-completeness checks that must pass before any chain |
+| `txpipe-sacc-to-likelihood` | take a TXPipe sacc (tracers `source_i/lens_i`, maybe no covariance) to a firecrown likelihood |
+| `txpipe-measurement` | compose, validate and run a TXPipe 3x2pt pipeline (local env or facility) |
+| `lsst-3x2pt-forecast` | augur Y1/Y10 Fisher forecast end to end, plausible numbers, pitfalls |
+| `hpc-dispatch-handoff` | run the heavy kernels on ALCF/NERSC through the client's hep-genesis facility tools |
+
+## Example queries
+
+Try these from the hep-genesis-agent desktop app or Claude Desktop with the
+server registered. Each maps to one family or one skill; the last ones need a
+facility sign-in on the client.
+
+1. *"Using CCL, compute the comoving distance, angular diameter distance and growth factor from z=0 to 3 for Planck 2018 and plot them."*
+2. *"Compare the nonlinear matter power spectrum at z=0.5 from CCL halofit, CCL HMcode-2020 and CosmicEmu on the same k grid in h/Mpc, and report the maximum fractional difference below k=1 h/Mpc."*
+3. *"Generate the LSST Y1 SRD source and lens n(z) bins, compute all 3x2pt angular power spectra for ell 20–2000 with non-Limber clustering, and write them to a sacc file."*
+4. *"Inspect this sacc file: tracers, data types, covariance. Then attach a Gaussian covariance with f_sky=0.4, sigma_e=0.26, n_gal=10 per arcmin² and compute the firecrown log-likelihood at the vanilla cosmology."*
+5. *"Scan the log-likelihood in sigma8 between 0.7 and 0.9 for the DES Y1 3x2pt test data vector with fiducial nuisance parameters and report the 1-sigma interval."*
+6. *"Run an LSST Y1 3x2pt Fisher forecast with augur using the SRD covariance, varying Omega_c, sigma8, w0, wa, n_s, h and the lens biases; give the marginalised 1-sigma errors and the w0–wa figure of merit, and plot the contours."*
+7. *"Repeat the forecast for Y10 and tell me by how much the w0–wa FoM improves."*
+8. *"Describe the TXTwoPoint stage: its inputs, outputs and configuration options with defaults."*
+9. *"Build a TXPipe pipeline for the metadetect example data that produces real-space 3x2pt measurements, show me the stage list and the dry-run commands."*
+10. *"Export this server's dispatch pack and run the Y10 Fisher forecast on Perlmutter with the desc-python environment; confirm the host it ran on."* (hosted server: the client's hep-genesis facility tools run the pack) — or, with the server on your own machine and the hep-genesis backend installed: *"Set dispatch to Perlmutter and run the Y10 Fisher forecast there with env_setup for desc-python."*
+11. *"Walk me through the desc-tour skill."*
+
+### Heavy jobs for NERSC Perlmutter / ALCF Polaris
+
+These run for tens of minutes to hours on a compute node and need a facility
+sign-in on the client plus a facility environment for the DESC stack
+(`env_setup`; on NERSC the `desc-python` or `desc-cosmology` stacks, on ALCF an
+environment you built from `desc-cosmology-env` — see `ENVIRONMENT.md`).
+Every chain, forecast and pipeline below goes through `export_dispatch_pack`
+(hosted server) or `set_dispatch` (server on your own machine); the tools
+report the host they ran on. Chains longer than ~30 minutes on Perlmutter
+need the `regular` QOS (`NERSC_MCMC_QOS`), not `debug`.
+
+12. **MCMC** — *"Build the firecrown likelihood for the DES Y1 3x2pt test data vector, check chi2/dof at the fiducial point, then run a Cobaya chain on Perlmutter with the desc-python environment sampling Omega_c, sigma8, w0, wa, h, n_s and the five lens biases with uniform priors, max_samples 20000 and R-1 < 0.02. Report whether it converged, the means and 68% intervals, and the trace plot."* (`firecrown_run_chain`; a `max_samples` of 200 is the local smoke run)
+13. **Same chain on ALCF** — *"Export the dispatch pack and run the same chain on Polaris under my environment at `/eagle/<project>/<user>/envs/desc-cosmology`; compare the posterior means and R-1 with the Perlmutter run and confirm both hosts."*
+14. **Chain on a TXPipe measurement** — *"Take the `twopoint_data_real.sacc` from the TXPipe run, prepare it for firecrown, attach a Gaussian covariance with f_sky=0.05, sigma_e=0.26, n_gal=10 per arcmin², verify chi2/dof at Planck 2018, then run a 10000-sample chain in Omega_c, sigma8 and w0 on Perlmutter."* (`txpipe-sacc-to-likelihood` skill, then `firecrown_run_chain`)
+15. **Big Fisher forecast** — *"Generate an LSST Y10 3x2pt forecast config with the TJPCov covariance and the CAMB transfer function, varying Omega_c, Omega_b, sigma8, h, n_s, w0, wa, m_nu, all ten lens biases, the IA amplitude and the five source delta_z shifts with the SRD photo-z priors; validate it, run augur_compute_fisher on Perlmutter with a 4-hour walltime, and report the marginalised errors and the w0–wa FoM with and without the priors."* (41 full theory-vector evaluations with CAMB)
+16. **Derivative-step study** — *"Repeat the Y10 Fisher on Polaris with derivative steps of 0.5%, 1%, 2% and 5% and tell me how stable the w0–wa FoM is; flag any non-positive-definite result."*
+17. **Full TXPipe pipeline** — *"Compose a TXPipe 3x2pt_fourier pipeline for the 20 deg² DC2 metadetect catalog at `$CFS/<project>/<user>/txpipe/data`, nside 2048, five source and five lens bins; validate it, run it on Perlmutter with 128 threads and a 6-hour walltime under my TXPipe environment, then inspect the resulting sacc and give me the per-stage status."* (`txpipe_run_pipeline` keeps the HDF5 catalogs and maps on the facility and returns the sacc, PNGs and log tails)
+18. **Likelihood profiles in batch** — *"For w0 = -1.2, -1.0 and -0.8, scan the DES Y1 3x2pt log-likelihood in sigma8 between 0.65 and 0.95 with 200 points each on Perlmutter, and report how the 1-sigma interval in sigma8 shifts with w0."* (three dispatched `firecrown_scan_loglike` jobs)
+19. **Large CCL grid (pip-kernel, no DESC environment needed)** — *"On Polaris, compute the non-Limber 3x2pt angular power spectra for the LSST Y10 SRD bins (5 source + 10 lens, ell 2–5000) with the CAMB transfer function and HMcode-2020 baryons on a 5×5 grid of (w0, wa), and report the largest Limber-vs-non-Limber fractional difference per bin pair at ell < 100."*
+20. **Cross-facility check** — *"Run the Y1 Fisher forecast with the SRD covariance on both Perlmutter and Polaris, confirm the hosts, and show that the marginalised errors agree to better than 1%."*
+
+## Design principles
+
+- **Packages untouched**: nothing under `CCL/`, `CCLX/`, `TXPipe/`,
+  `firecrown/`, `augur/` is modified; the server reads them (example data,
+  n(z) tables, stage metadata) and installs them from copies.
+- **One cosmology object, firecrown's names**: the same `cosmology` JSON
+  feeds CCL, firecrown and augur; `convert_cosmology_names` translates to
+  Cobaya, CosmoSIS and the emulator server.
+- **sacc is the contract between families**: TXPipe writes it, CCL and augur
+  generate it, firecrown reads it. `sacc_prepare_for_firecrown` bridges the
+  one naming mismatch (TXPipe `source_i/lens_i` vs firecrown `src{i}/lens{i}`).
+- **Compose, validate, then run**: every heavy step is preceded by
+  millisecond-scale validation (YAML, parameter completeness, DAG checks) so a
+  bad request never costs queue time.
+- **Kernel/wrapper split**: heavy computations live in kernels that are
+  JSON-safe and runnable on a facility node; wrappers handle files, labels,
+  plots and metadata wherever the server runs.
+- **Files, not arrays**: CSV / sacc / PNG artifacts with provenance headers;
+  only paths and quotable summaries pass through the LLM context.
+
+## Hosting
+
+Same recipe as the other HEP-KE servers (a Linux box behind a reverse proxy):
+
+1. Clone, run `scripts/setup_env.sh`, keep the reference clones next to the
+   repo (or point `DESC_*_DIR` at them).
+2. Run under systemd with the HTTP transport bound to localhost and
+   `MCP_PUBLIC=1`, `MCP_OUTPUT_ROOT=/srv/artifacts`,
+   `MCP_ARTIFACT_URL=https://files.example.org`.
+3. TLS reverse proxy in front: one route to the server port, one static file
+   server on `MCP_OUTPUT_ROOT`.
+4. After every deploy: `python tests/smoke_server.py <url>`.
+
+The hosted server needs **no** facility sign-in, project, or environment
+settings and ships no example data; see the next section.
+
+## Run on HPC
+
+All facility access goes through the hep-genesis dispatch engine (IRI for
+job submission, Globus Transfer or the IRI filesystem API for staging and
+results). This server writes no batch scripts, opens no SSH sessions, and
+holds no facility identity: project, workdir, tokens, Globus endpoint and
+the facility-side software environment are the **user's**, supplied by the
+client per call.
+
+**Client-side dispatch (hosted deployments — recommended).** `export_dispatch_pack`
+returns the `tools/` kernels plus a manifest. The client's hep-genesis
+facility server runs them with `run_pack_kernel` under the user's
+credentials. Two kernel kinds:
+
+| Kind | Used by | Node needs |
+|---|---|---|
+| pip-kernel | `ccl_*` grids | `pip_deps` from the manifest (`pyccl`, `camb` wheels; installed by the engine) |
+| env-kernel | firecrown loglike/scan/chain, augur forecast, TXPipe pipeline | a facility environment with the DESC stack, named by the user in `env_setup` |
+
+firecrown and numcosmo are conda-only, which is why env-kernels exist. The
+manifest lists public candidates for `env_setup` — on NERSC the DESC
+`desc-python` stack (`source /global/common/software/lsst/common/miniconda/setup_current_python.sh`)
+or `desc-cosmology`; on ALCF a user-built environment from
+`desc-cosmology-env` — and the user chooses. The `hpc-dispatch-handoff`
+skill walks an agent through it.
+
+**Server-side dispatch (server on your own machine).** With
+`pip install -e <hep-genesis-agent>/backend[iri]` in the env and a facility
+sign-in, `set_dispatch("perlmutter")` makes the heavy tools dispatch
+themselves; env-kernel tools take `env_setup` as an argument. Do not use this
+mode on shared deployments.

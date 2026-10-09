@@ -1,0 +1,16 @@
+Goal is to create MCP servers from Publicly available packages from https://github.com/LSSTDESC/
+
+We start with 4 packages: CCL, TXPipe, firecrown, augur. Absolutely no changes to be made in these packages. Any development should be made separately. Also these packages might be improved from the developers over time too. 
+
+
+(1) First thing to do is to check some preliminary workflows - for instance CCLX/ is another repo that shows examples of how to use CCL. Find similar things with TXPipe and firecrown too (there might be examples in LSSTDESC github.). Feel free to git clone other packages as needed, as long as they are from the LSSTDESC org. 
+
+We may need to see some good examples of these packages working together too. 
+
+(2) Start building the MCP server wrapper. We should be able to run the codes in HPCs -- so the dispatch branch in /Users/nesar/Projects/Tutorials/cosmic_emulator_server is a good template - follow this as much as possible. We should be able to run codes on HPCs as needed. The wrapper tools should have sufficient information. 
+
+The MCP server should also have server-side skills -- these should be helpful for making pipelines work that use the combination of tools.
+
+In the README of this MCP server, make sure we have a few examples of queries we can use (and I can check them from the hep-genesis-agent and claude desktop). 
+
+
