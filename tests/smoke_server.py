@@ -121,6 +121,61 @@ async def run(session: ClientSession):
                     RESULTS.append(("closure chi2 (CCL data == firecrown theory)",
                                     "OK" if ok else "FAIL", f"chi2 = {chi2:.3g} (expect ~0)"))
 
+    # --- namaster -> tjpcov -> firecrown -> smokescreen on a tiny simulation
+    sim = await call(s, "namaster_simulate_maps",
+                     {"output_dir": OUT, "nside": 32, "f_sky": 0.3, "seed": 1,
+                      "tracers": [{"name": "src0", "kind": "shear", "z_mean": 0.9, "z_sigma": 0.25, "n_gal_arcmin2": 8},
+                                  {"name": "lens0", "kind": "density", "z_mean": 0.5, "z_sigma": 0.1,
+                                   "bias": 1.6, "n_gal_arcmin2": 4}],
+                      "cosmology": {"transfer_function": "eisenstein_hu"}})
+    fields_json = (sim or {}).get("metadata", {}).get("fields_json")
+    if fields_json:
+        await call(s, "namaster_mask_properties", {"output_dir": OUT, "mask_path": sim["metadata"]["mask"]})
+        meas = await call(s, "namaster_compute_cls",
+                          {"output_dir": OUT, "fields_json": fields_json, "include_b_modes": False,
+                           "binning": {"scheme": "linear", "nlb": 16, "ell_min": 8, "ell_max": 88},
+                           "theory_csv": sim["metadata"]["theory_cls_csv"]})
+        meas_sacc = (meas or {}).get("metadata", {}).get("sacc")
+        if meas_sacc:
+            await call(s, "tjpcov_list_covariance_types", {})
+            fsky = meas["metadata"]["fields"]["src0"]["fsky_eff"]
+            cfg = await call(s, "tjpcov_generate_config",
+                             {"output_dir": OUT, "sacc_path": meas_sacc, "cov_types": ["FourierGaussianFsky"],
+                              "f_sky": fsky, "n_gal": {"src0": 8, "lens0": 4}, "galaxy_bias": 1.6,
+                              "cosmology": {"transfer_function": "eisenstein_hu"}})
+            cfg_path = (cfg or {}).get("metadata", {}).get("config_path")
+            if cfg_path:
+                cov = await call(s, "tjpcov_compute_covariance", {"output_dir": OUT, "config_path": cfg_path})
+                cov_sacc = (cov or {}).get("metadata", {}).get("output_sacc")
+                knox = await call(s, "sacc_attach_gaussian_covariance",
+                                  {"output_dir": OUT, "sacc_path": meas_sacc, "f_sky": fsky,
+                                   "n_gal": {"src0": 8, "lens0": 4}, "galaxy_bias": 1.6,
+                                   "cosmology": {"transfer_function": "eisenstein_hu"}})
+                knox_sacc = first_file(knox, ".hdf5")
+                if cov_sacc and knox_sacc:
+                    await call(s, "tjpcov_compare_covariances",
+                               {"output_dir": OUT, "sacc_a": knox_sacc, "sacc_b": cov_sacc,
+                                "label_a": "knox", "label_b": "tjpcov"})
+                if cov_sacc:
+                    exp2 = await call(s, "firecrown_build_likelihood",
+                                      {"output_dir": OUT, "sacc_path": cov_sacc, "name": "measured",
+                                       "transfer_function": "eisenstein_hu"})
+                    yaml2 = first_file(exp2, ".yaml")
+                    if yaml2:
+                        conc = await call(s, "smokescreen_conceal_datavector",
+                                          {"output_dir": OUT, "experiment_yaml": yaml2, "seed": "smoke-seed",
+                                           "shifts": {"Omega_c": [0.2, 0.32], "sigma8": [0.72, 0.9]},
+                                           "nuisance": {"lens0_bias": 1.6},
+                                           "reference_cosmology": {"transfer_function": "eisenstein_hu"}})
+                        concealed = first_file(conc, ".hdf5") or first_file(conc, ".fits")
+                        if concealed:
+                            await call(s, "smokescreen_inspect", {"output_dir": OUT, "sacc_path": concealed})
+                            enc = await call(s, "smokescreen_encrypt_file", {"output_dir": OUT, "path": cov_sacc})
+                            if enc:
+                                await call(s, "smokescreen_decrypt_file",
+                                           {"output_dir": OUT, "path": first_file(enc, ".encrpt"),
+                                            "key_path": first_file(enc, ".key")})
+
     # --- txpipe (compose + validate only; never runs TXPipe)
     await call(s, "txpipe_list_stages", {"group": "two-point"})
     await call(s, "txpipe_describe_stage", {"name": "TXTwoPoint"})

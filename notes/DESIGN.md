@@ -285,3 +285,18 @@ Answer: clone
   the client's facility server, not this one. The README will show both phrasings.
   Answer: OK. The hep-genesis-agent should be able to handle this. 
 Also I didnt fully understnad that **TXPipe tools are "compose + dispatch", never "import txpipe".. Hopefully it's not an issue.**
+
+---
+
+## 9. Addendum 2026-10-09 — three more families
+
+TJPCov (`tjpcov_*`), NaMaster (`namaster_*`) and Smokescreen (`smokescreen_*`)
+were added as tool families (54 tools, 10 families); the remaining LSSTDESC
+candidates and their priority are in `notes/FUTURE_FAMILIES.md`. Decisions:
+TJPCov runs as an env-kernel (`tools/inner/tjpcov_cov.py`) with the real-space
+matrix assembled block by block (TJPCov 0.5.1's calculator path is broken for
+xi_+/xi_- ordering) and top-hat windows for its f_sky binning; NaMaster runs as
+an env-kernel (`tools/inner/namaster_cls.py`) writing sacc with windows and
+coupled noise; Smokescreen wraps the firecrown experiment YAML in a generated
+`build_likelihood` module and never records the hidden shift or the seed.
+Upstream incompatibility: TJPCov's NaMaster covariance needs pymaster < 3.

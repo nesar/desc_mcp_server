@@ -30,8 +30,8 @@ if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
         "python=3.12" \
         "numpy>=2.0,<2.4" "scipy>=1.13" "camb<2.0" \
         "pyccl>=3.3.1" "sacc>=2.4" "firecrown>=1.16" \
-        "tjpcov>=0.5" "lsstdesc-ceci>=2.4" "lsstdesc-crow" \
-        "qp-prob" "healpy" "numdifftools" "jinja2" \
+        "tjpcov>=0.5" "namaster" "lsstdesc-ceci>=2.4" "lsstdesc-crow" \
+        "qp-prob" "healpy" "numdifftools" "jinja2" "cryptography" \
         "matplotlib-base" "h5py" "astropy" "pyyaml" "pip"
 fi
 ENV_PREFIX="$(conda info --base)/envs/$ENV_NAME"
@@ -51,6 +51,20 @@ cp -R "$REPO_DIR/augur" "$AUGUR_BUILD"
 rm -rf "$AUGUR_BUILD/.git"
 $PIP install --no-deps "$AUGUR_BUILD"
 rm -rf "$(dirname "$AUGUR_BUILD")"
+
+# --- Smokescreen from its clone (external/Smokescreen), same pattern: the
+#     conda-forge package lags the repo; deps that are not already in the env
+#     (jsonargparse for its CLI parser, cryptography for Fernet) via pip.
+if [ -d "$REPO_DIR/external/Smokescreen" ]; then
+    $PIP install "jsonargparse[signatures]>=4.0" cryptography
+    SMOKE_BUILD="$(mktemp -d)/Smokescreen"
+    cp -R "$REPO_DIR/external/Smokescreen" "$SMOKE_BUILD"
+    rm -rf "$SMOKE_BUILD/.git"
+    $PIP install --no-deps "$SMOKE_BUILD"
+    rm -rf "$(dirname "$SMOKE_BUILD")"
+else
+    echo "NOTE: external/Smokescreen not found; smokescreen_* tools will refuse to run (git clone https://github.com/LSSTDESC/Smokescreen external/Smokescreen and rerun)."
+fi
 
 # --- the server itself ---------------------------------------------------
 $PIP install --no-deps -e "$REPO_DIR"

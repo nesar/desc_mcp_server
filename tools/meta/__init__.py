@@ -55,7 +55,8 @@ def list_desc_packages() -> ArtifactResult:
 
 @validate_call
 def describe_desc_tool_family(
-    family: Annotated[Literal["meta", "ccl", "sacc", "firecrown", "augur", "txpipe", "dispatch"],
+    family: Annotated[Literal["meta", "ccl", "sacc", "firecrown", "augur", "txpipe", "tjpcov", "namaster",
+                              "smokescreen", "dispatch"],
                       Field(description="Tool-family key from list_desc_packages.")],
 ) -> ArtifactResult:
     """Describe one tool family: every tool with its one-line purpose, weight

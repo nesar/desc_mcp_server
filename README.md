@@ -4,9 +4,12 @@ MCP server exposing the public **LSST DESC** cosmology stack as agent tools:
 [CCL](https://github.com/LSSTDESC/CCL) theory predictions,
 [sacc](https://github.com/LSSTDESC/sacc) data vectors,
 [firecrown](https://github.com/LSSTDESC/firecrown) likelihoods,
-[augur](https://github.com/LSSTDESC/augur) Fisher forecasts, and
-[TXPipe](https://github.com/LSSTDESC/TXPipe) measurement pipelines — 43
-tools in seven families, with server-side skills for the multi-tool pipelines
+[augur](https://github.com/LSSTDESC/augur) Fisher forecasts,
+[TXPipe](https://github.com/LSSTDESC/TXPipe) measurement pipelines,
+[TJPCov](https://github.com/LSSTDESC/TJPCov) covariances,
+[NaMaster](https://github.com/LSSTDESC/NaMaster) pseudo-C_ell measurements and
+[Smokescreen](https://github.com/LSSTDESC/Smokescreen) data-vector concealment — 54
+tools in ten families, with server-side skills for the multi-tool pipelines
 and optional execution of the heavy steps on ALCF Polaris / NERSC Perlmutter
 through the [hep-genesis](https://github.com/HEP-KE/hep-genesis-agent)
 dispatch engine.
@@ -27,7 +30,7 @@ Companion documents:
 ```bash
 bash scripts/setup_env.sh                 # creates conda env "desc-mcp" (~3 min, conda-forge only)
 conda activate desc-mcp
-python tests/smoke_env.py                 # 7 environment checks
+python tests/smoke_env.py                 # 10 environment checks
 python -m pytest tests/ -q                # in-process tool tests
 python tests/smoke_server.py              # every family through a live MCP session
 python -m mcp_server                      # stdio transport
@@ -55,6 +58,9 @@ hep-genesis-agent desktop app's server list — at the HTTP endpoint
 | firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain` | firecrown 1.16 factory API, Cobaya (pure-CCL mode) |
 | augur | `augur_list_examples`, `augur_generate_forecast_config`, `augur_validate_forecast_config`, `augur_generate_synthetic_datavector`, `augur_compute_fisher`, `augur_plot_fisher_contours` | augur 1.2.4 (+ TJPCov, numdifftools / derivkit) |
 | txpipe | `txpipe_list_stages`, `txpipe_describe_stage`, `txpipe_list_examples`, `txpipe_generate_pipeline`, `txpipe_validate_pipeline`, `txpipe_run_pipeline`, `txpipe_run_status`, `txpipe_fetch_example_data` | TXPipe source (read as metadata) + ceci; runs in a separate TXPipe env or on a facility |
+| tjpcov | `tjpcov_list_covariance_types`, `tjpcov_generate_config`, `tjpcov_compute_covariance`, `tjpcov_compare_covariances` | tjpcov 0.5.1: Gaussian f_sky (harmonic and real space), halo-model SSC and cNG terms; NaMaster-coupled types need NaMaster 2.x (facility env) |
+| namaster | `namaster_mask_properties`, `namaster_simulate_maps`, `namaster_compute_cls` | pymaster 3.0 + healpy: masks, simulated Gaussian maps from CCL theory, pseudo-C_ell bandpowers -> sacc with windows and coupled noise |
+| smokescreen | `smokescreen_conceal_datavector`, `smokescreen_inspect`, `smokescreen_encrypt_file`, `smokescreen_decrypt_file` | smokescreen 1.5.6 over the firecrown family's experiment YAML; never deletes originals, never records the hidden shift |
 | dispatch | `set_dispatch`, `get_dispatch`, `auth_status`, `export_dispatch_pack` | hep-genesis engine (IRI + Globus) |
 
 Conventions every tool follows: redshift `z` at the boundary (never scale
@@ -81,6 +87,8 @@ through `list_desc_skills` / `load_desc_skill` and as native MCP prompts.
 | `txpipe-sacc-to-likelihood` | take a TXPipe sacc (tracers `source_i/lens_i`, maybe no covariance) to a firecrown likelihood |
 | `txpipe-measurement` | compose, validate and run a TXPipe 3x2pt pipeline (local env or facility) |
 | `lsst-3x2pt-forecast` | augur Y1/Y10 Fisher forecast end to end, plausible numbers, pitfalls |
+| `maps-to-likelihood` | masked maps (or a simulated test bed) -> NaMaster bandpowers with windows -> TJPCov covariance -> firecrown chi2, with the binning/noise cross-checks |
+| `conceal-datavector` | Smokescreen concealment protocol: validate the likelihood, choose ranges and a seed, conceal, record, encrypt the original, analyse the concealed file |
 | `hpc-dispatch-handoff` | run the heavy kernels on ALCF/NERSC through the client's hep-genesis facility tools |
 
 ## Example queries
@@ -100,6 +108,11 @@ facility sign-in on the client.
 9. *"Build a TXPipe pipeline for the metadetect example data that produces real-space 3x2pt measurements, show me the stage list and the dry-run commands."*
 10. *"Export this server's dispatch pack and run the Y10 Fisher forecast on Perlmutter with the desc-python environment; confirm the host it ran on."* (hosted server: the client's hep-genesis facility tools run the pack) — or, with the server on your own machine and the hep-genesis backend installed: *"Set dispatch to Perlmutter and run the Y10 Fisher forecast there with env_setup for desc-python."*
 11. *"Walk me through the desc-tour skill."*
+12. *"Simulate shear and clustering maps at nside 128 with f_sky 0.3, measure the 3x2pt bandpowers with NaMaster in linear bins of width 20, and show me the measured spectra against the input theory."* (`namaster_simulate_maps` -> `namaster_compute_cls`)
+13. *"Give that measured sacc a TJPCov covariance (Gaussian plus super-sample, f_sky from the mask), compare it with the plain Knox covariance, and report the chi2 at the input cosmology."* (`maps-to-likelihood` skill)
+14. *"Here is my HEALPix shear catalog map and mask: what is the effective f_sky with a 1-degree apodization, and what are the EE and BB bandpowers between ell 30 and 1500?"* (`namaster_mask_properties`, `namaster_compute_cls`)
+15. *"Compute a real-space Gaussian covariance with TJPCov for this xi_+/xi_-/gamma_t/w(theta) sacc (f_sky 0.1, lmax 3000) and check it is positive definite."* (`tjpcov_generate_config` with RealGaussianFsky)
+16. *"Conceal the DES Y1 3x2pt data vector with Smokescreen - hide Omega_c in [0.2, 0.32] and sigma8 in [0.72, 0.9] with a seed I give you, encrypt the original, and set up the likelihood on the concealed file."* (`conceal-datavector` skill)
 
 ### Heavy jobs for NERSC Perlmutter / ALCF Polaris
 
@@ -125,8 +138,11 @@ need the `regular` QOS (`NERSC_MCMC_QOS`), not `debug`.
 ## Design principles
 
 - **Packages untouched**: nothing under `CCL/`, `CCLX/`, `TXPipe/`,
-  `firecrown/`, `augur/` is modified; the server reads them (example data,
-  n(z) tables, stage metadata) and installs them from copies.
+  `firecrown/`, `augur/` or `external/` (TJPCov, NaMaster, Smokescreen, sacc,
+  ceci, ...) is modified; the server reads them (example data, n(z) tables,
+  stage metadata) and installs them from copies. Upstream quirks are worked
+  around in the server (e.g. TJPCov's real-space block ordering, NaMaster
+  windows vs TJPCov's f_sky binning), never patched in the clones.
 - **One cosmology object, firecrown's names**: the same `cosmology` JSON
   feeds CCL, firecrown and augur; `convert_cosmology_names` translates to
   Cobaya, CosmoSIS and the emulator server.

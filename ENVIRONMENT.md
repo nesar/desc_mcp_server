@@ -17,7 +17,10 @@ a clone directory (the CCL source tree shadows the installed `pyccl`).
 | numcosmo | 0.28 | conda-forge | pulled by firecrown (n(z) generators) |
 | lsstdesc-crow | 1.0.12 | conda-forge | pulled by firecrown (cluster statistics) |
 | augur | 1.2.4 | **built from the clone** (`augur/`) via a temporary copy | Fisher forecasts |
-| tjpcov | 0.5.1 | conda-forge | covariances (augur `cov_type: tjpcov`) |
+| tjpcov | 0.5.1 | conda-forge | `tjpcov_*` covariances (Gaussian f_sky, SSC, cNG, real space); augur `cov_type: tjpcov` |
+| pymaster (NaMaster) | 3.0 | conda-forge (`namaster`, pulled by tjpcov) | `namaster_*` bandpowers, masks, simulated maps |
+| smokescreen | 1.5.6 | **built from the clone** (`external/Smokescreen`) via a temporary copy | `smokescreen_*` data-vector concealment, encryption |
+| jsonargparse, cryptography | 4.x, 46.x | pip | Smokescreen's CLI parser and Fernet encryption |
 | lsstdesc-ceci | 2.5.1 | conda-forge | pipeline YAML handling for the TXPipe family (TXPipe itself is NOT installed) |
 | cosmosis | 3.26 | conda-forge (via firecrown-deps) | present; CSL not built; not used by first-release tools |
 | cobaya, getdist | 3.6.2 | pip | `firecrown_run_chain` (pure-CCL mode, no CAMB theory block) |
@@ -111,3 +114,33 @@ the engine installs `pyccl` + `camb` wheels into a persistent venv on the node.
 - The hep-genesis engine runs the facility's module python when a kernel
   declares no pip deps; the env-kernel (`tools/envkernel.py`) relies on that
   to launch inner scripts under `env_setup`.
+- **NaMaster 3 vs TJPCov 0.5.1**: TJPCov's `FourierGaussianNmt` (and the
+  mask-based SSC/cNG types) calls `NmtCovarianceWorkspace()` without
+  fields, the NaMaster 2 API; pymaster 3.0 (what conda-forge resolves today)
+  raises `TypeError`. `tjpcov_compute_covariance` reports this plainly; the
+  f_sky types work. Run NaMaster-coupled covariances under a NaMaster 2.x
+  environment on a facility (`env_setup`) until TJPCov catches up.
+- **NaMaster 3 requires fields and bins to share lmax**: `namaster_compute_cls`
+  builds the fields at the binning's lmax (= last bandpower edge - 1), and
+  the inner TJPCov script sets `NaMaster: {f: {lmax: ...}}` for TJPCov's own
+  mask fields.
+- **Dense windows vs TJPCov's f_sky binning**: TJPCov reads bandpower edges
+  from the sacc windows as "where the weight is nonzero" - meaningless for
+  mode-coupled NaMaster windows. `namaster_compute_cls` stores the edges in
+  the sacc metadata (`binning/ell_edges`) and `tjpcov_compute_covariance`
+  hands TJPCov a copy with top-hat windows on those edges (the covariance is
+  attached to the original file, dense windows kept). The Knox tool
+  (`sacc_attach_gaussian_covariance`) now takes the number of modes from each
+  point's own window column, which is exact for either kind.
+- **TJPCov real space**: the `CovarianceCalculator` path assumes xi_+/xi_-
+  interleaved per theta inside a tracer pair and never fills the xi_- auto
+  block (an index slip in its `auto` shortcut) - singular matrices for
+  TXPipe/firecrown-ordered files. The inner script assembles
+  `RealGaussianFsky` block by block through TJPCov's public per-block method
+  instead. Small-angle xi_- needs `lmax >= 3000` (the projection truncates
+  the Fourier covariance); lower lmax gives a matrix spanning 20 decades that
+  rounds to "not positive definite".
+- `pip install` of Smokescreen from the clone would write build metadata into
+  the clone; the setup script builds from a temporary copy (as for augur).
+  Smokescreen's own CLI deletes the original sacc after encrypting it; the
+  server's tools never delete anything.

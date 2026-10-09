@@ -17,7 +17,7 @@ or opens SSH sessions.
 | Kind | Examples | Node-side needs | How the client runs it |
 |---|---|---|---|
 | **pip-kernel** | `ccl.kernels.*` (pure pyccl) | `pip_deps` from the manifest (`pyccl`, `camb` wheels) | `run_pack_kernel(function=<kernel>, args={...}, pip_deps=[...])` |
-| **env-kernel** | firecrown loglike/scan/chain, augur forecast, TXPipe pipeline | a facility environment containing the DESC stack, named by the user in `env_setup` | `run_pack_kernel(function="envkernel.run_in_env", args={"env_setup": "...", "inner": "<name>", "params": {...}}, pip_deps=[])` |
+| **env-kernel** | firecrown loglike/scan/chain, augur forecast, TXPipe pipeline, TJPCov covariance (`tjpcov_cov`), NaMaster bandpowers (`namaster_cls`; map and mask paths must be facility paths) | a facility environment containing the DESC stack, named by the user in `env_setup` | `run_pack_kernel(function="envkernel.run_in_env", args={"env_setup": "...", "inner": "<name>", "params": {...}}, pip_deps=[])` |
 
 firecrown and numcosmo are conda-only (not on PyPI), which is why env-kernels
 exist: the engine's venv + pip bootstrap cannot build them on a node.

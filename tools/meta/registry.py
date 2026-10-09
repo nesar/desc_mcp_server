@@ -68,15 +68,47 @@ PACKAGES: dict[str, dict] = {
         "status": "active",
     },
     "tjpcov": {
-        "role": "Covariance calculator (Gaussian f_sky, NaMaster, SSC) used by augur "
-                "(cov_type: tjpcov) and TXPipe's covariance stages",
-        "families": ["augur", "txpipe"],
+        "role": "Covariance calculator: Gaussian (f_sky or NaMaster mode-coupled), halo-model "
+                "super-sample and connected non-Gaussian terms, real-space projections; also used "
+                "by augur (cov_type: tjpcov) and TXPipe's covariance stages",
+        "families": ["tjpcov", "augur", "txpipe"],
         "import_name": "tjpcov",
         "clone_version": "0.5.1",
+        "units": "Ngal_<tracer> in galaxies/arcmin^2; f_sky as a fraction; theta in arcmin; "
+                 "cosmology via pyccl.Cosmology kwargs",
         "citation": "github.com/LSSTDESC/TJPCov",
         "license": "BSD-3-Clause",
         "repo": "https://github.com/LSSTDESC/TJPCov",
-        "status": "indirect",
+        "status": "active",
+    },
+    "pymaster": {
+        "role": "NaMaster: pseudo-C_ell (MASTER) power spectra of masked spin-0/spin-2 HEALPix maps, "
+                "bandpower windows, mask apodization, Gaussian covariance couplings; the estimator "
+                "behind TXPipe's Fourier-space measurements and TJPCov's NaMaster covariances",
+        "families": ["namaster"],
+        "import_name": "pymaster",
+        "clone_version": "3.0 (external/NaMaster)",
+        "units": "HEALPix RING maps; apodization scales in degrees; C_ell dimensionless; "
+                 "n(z) tracers written to sacc when given",
+        "citation": "Alonso, Sanchez, Slosar et al. 2019, MNRAS 484, 4127 (arXiv:1809.09603)",
+        "license": "BSD-3-Clause",
+        "repo": "https://github.com/LSSTDESC/NaMaster",
+        "status": "active",
+    },
+    "smokescreen": {
+        "role": "Data-vector concealment (blinding): shifts a sacc data vector by the firecrown theory "
+                "difference between a hidden cosmology (drawn from ranges with a seed) and the "
+                "reference cosmology; Fernet encryption of files",
+        "families": ["smokescreen"],
+        "import_name": "smokescreen",
+        "clone_version": "1.5.6 (external/Smokescreen)",
+        "parameter_names": "pyccl cosmology names for the shifts (Omega_c Omega_b h n_s sigma8|A_s "
+                           "Omega_k Neff m_nu w0 wa); nuisance held at reference values",
+        "citation": "Loureiro et al. 2025 (JOSS); Muir et al. 2021 (blinding method)",
+        "license": "BSD-3-Clause",
+        "repo": "https://github.com/LSSTDESC/Smokescreen",
+        "note": "installed from the clone; needs firecrown + pyccl + sacc; never deletes originals here",
+        "status": "active",
     },
     "ceci": {
         "role": "Pipeline framework TXPipe runs on: stage classes with declared "
@@ -120,6 +152,12 @@ FAMILIES: dict[str, dict] = {
               "summary": "LSST Y1/Y10 Fisher forecasts: config, synthetic data, Fisher, contours"},
     "txpipe": {"module": "tools.txpipe_tools", "prefix": "txpipe_",
                "summary": "stage catalog, pipeline composition/validation, run locally or on a facility, inspect outputs"},
+    "tjpcov": {"module": "tools.tjpcov_tools", "prefix": "tjpcov_",
+               "summary": "analysis-grade covariances for sacc files: config, Gaussian/SSC/cNG/real-space terms, comparisons"},
+    "namaster": {"module": "tools.namaster_tools", "prefix": "namaster_",
+                 "summary": "pseudo-C_ell bandpowers from masked HEALPix maps -> sacc with windows; masks; simulated maps"},
+    "smokescreen": {"module": "tools.smokescreen_tools", "prefix": "smokescreen_",
+                    "summary": "data-vector concealment (blinding) through a firecrown likelihood; file encryption"},
     "dispatch": {"module": "mcp_server.dispatch", "prefix": "",
                  "summary": "HPC execution: set_dispatch, get_dispatch, auth_status, export_dispatch_pack"},
 }

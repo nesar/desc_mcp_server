@@ -98,6 +98,35 @@ def envkernel():
     return f"env-kernel ran under {out['env_check']['executable']}"
 
 
+def tjpcov_import():
+    import importlib.metadata as md
+    from tjpcov.covariance_calculator import CovarianceCalculator  # noqa: F401
+    from tjpcov.covariance_gaussian_fsky import FourierGaussianFsky, RealGaussianFsky  # noqa: F401
+    return f"tjpcov {md.version('tjpcov')} (CovarianceCalculator, Gaussian f_sky classes importable)"
+
+
+def namaster_small():
+    import numpy as np
+    import healpy as hp
+    import pymaster as nmt
+    nside = 16
+    mask = np.ones(hp.nside2npix(nside))
+    m = np.random.default_rng(0).normal(size=mask.size)
+    f = nmt.NmtField(mask, [m], lmax=3 * nside - 1)
+    b = nmt.NmtBin.from_nside_linear(nside, 8)
+    cl = nmt.compute_full_master(f, f, b)
+    assert cl.shape[0] == 1 and np.all(np.isfinite(cl))
+    return f"pymaster {nmt.__version__}: full-sky spin-0 bandpowers at nside {nside} ({cl.shape[1]} bins)"
+
+
+def smokescreen_import():
+    import importlib.metadata as md
+    from smokescreen import ConcealDataVector  # noqa: F401
+    from smokescreen.encryption import decrypt_file, encrypt_file  # noqa: F401
+    from smokescreen.param_shifts import draw_flat_or_deterministic_param_shifts  # noqa: F401
+    return f"smokescreen {md.version('smokescreen')} (ConcealDataVector, encryption importable)"
+
+
 if __name__ == "__main__":
     check("versions", versions)
     check("ccl P(k)", ccl_pk)
@@ -106,6 +135,9 @@ if __name__ == "__main__":
     check("augur import", augur_import)
     check("ceci + TXPipe clone", ceci_yaml)
     check("env-kernel", envkernel)
+    check("tjpcov import", tjpcov_import)
+    check("namaster bandpowers", namaster_small)
+    check("smokescreen import", smokescreen_import)
     fails = 0
     for name, status, detail in CHECKS:
         print(f"{status:5s} {name:26s} {detail}")

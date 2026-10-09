@@ -88,7 +88,7 @@ try:
 except Exception:
     out["error"] = traceback.format_exc()
 env_check = {{"python": sys.version.split()[0], "executable": sys.executable}}
-for name in ("pyccl", "sacc", "firecrown", "augur", "tjpcov", "ceci", "txpipe"):
+for name in ("pyccl", "sacc", "firecrown", "augur", "tjpcov", "ceci", "txpipe", "pymaster", "smokescreen"):
     try:
         m = importlib.import_module(name)
         env_check[name] = getattr(m, "__version__", "present")

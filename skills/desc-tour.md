@@ -1,6 +1,6 @@
 ---
 name: desc-tour
-description: One representative call per tool family (CCL theory, sacc inspection, firecrown likelihood, augur Fisher forecast, TXPipe pipeline composition) - the demo path that shows what this server does end to end in a few minutes, all local
+description: One representative call per tool family (CCL theory, sacc inspection, firecrown likelihood, augur Fisher forecast, TXPipe pipeline composition, NaMaster bandpowers from simulated maps, TJPCov covariance, Smokescreen concealment) - the demo path that shows what this server does end to end in a few minutes, all local
 ---
 
 # DESC server tour
@@ -39,7 +39,25 @@ runs locally in well under five minutes. Use one `output_dir` for the tour.
    and `txpipe_validate_pipeline`. Show the stage list and the dry-run
    command for TXTwoPoint; explain that running it needs a TXPipe
    environment (local `DESC_TXPIPE_ENV` or a facility `env_setup`).
+7b. **Measurement from maps (NaMaster)**: `namaster_simulate_maps`
+   (nside 64, one shear + one density tracer, f_sky 0.3) ->
+   `namaster_compute_cls(fields_json=..., include_b_modes=false,
+   theory_csv=<the simulation's theory>)`. The PNG shows the bandpowers on
+   top of the binned input theory; the sacc carries windows and the
+   coupled noise.
+7c. **Covariance (TJPCov)**: `tjpcov_generate_config(cov_types=
+   ['FourierGaussianFsky'], f_sky=<fsky_eff from 7b>, n_gal, galaxy_bias)`
+   -> `tjpcov_compute_covariance` (seconds) -> `tjpcov_compare_covariances`
+   against `sacc_attach_gaussian_covariance` on the same file: the median
+   sigma ratio should be ~1. Then `firecrown_build_likelihood` +
+   `firecrown_compute_loglike` on the TJPCov file: chi2/n ~ 1 at the
+   input cosmology (the simulation's bias as `nuisance`).
+7d. **Concealment (Smokescreen)**: `smokescreen_conceal_datavector` on
+   that experiment with ranges for Omega_c and sigma8 and a seed the user
+   gives; `smokescreen_inspect` shows concealed=true. Explain that the
+   hidden values are never recorded and that the analysis proceeds on
+   the concealed file.
 8. **Wrap up**: list the files produced, the one-line numbers from steps
-   2, 5 and 6, and point to `list_desc_skills` for the deeper recipes
-   (`lsst-3x2pt-forecast`, `txpipe-sacc-to-likelihood`, `pk-ccl-vs-emulators`,
-   `hpc-dispatch-handoff`).
+   2, 5, 6 and 7c, and point to `list_desc_skills` for the deeper recipes
+   (`lsst-3x2pt-forecast`, `txpipe-sacc-to-likelihood`, `maps-to-likelihood`,
+   `conceal-datavector`, `pk-ccl-vs-emulators`, `hpc-dispatch-handoff`).

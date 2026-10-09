@@ -521,12 +521,20 @@ def _delta_ell_per_point(s, ell_edges: list[float] | None) -> np.ndarray:
         for j, i in enumerate(idx):
             w = s.data[i].tags.get("window")
             if isinstance(w, _sacc.BandpowerWindow):
+                # Effective bandwidth of THIS point's window column: the number
+                # of modes a weighted bandpower averages over, N = (sum w(2l+1))^2 /
+                # sum w^2(2l+1), expressed as a width at the point's ell. Exact
+                # for top-hat windows; right for dense NaMaster (mode-coupled)
+                # windows too, where "where the weight is nonzero" is not.
                 vals = np.asarray(w.values, float)
                 wt = np.asarray(w.weight, float)
-                wt = wt[:, 0] if wt.ndim > 1 else wt
-                m = wt > 1e-3 * wt.max()
-                if m.sum() > 0:
-                    dl[i] = max(float(vals[m].max() - vals[m].min() + 1), 1.0)
+                col = int(s.data[i].tags.get("window_ind", 0) or 0)
+                wt = wt[:, min(col, wt.shape[1] - 1)] if wt.ndim > 1 else wt
+                two_l_plus_1 = 2.0 * vals + 1.0
+                den = float(np.sum(wt ** 2 * two_l_plus_1))
+                if den > 0:
+                    n_modes = float(np.sum(wt * two_l_plus_1)) ** 2 / den
+                    dl[i] = max(n_modes / (2.0 * ells[j] + 1.0), 1.0)
                     done[j] = True
         if done.all():
             continue

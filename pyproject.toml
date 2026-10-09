@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "desc-mcp-server"
 version = "0.1.0"
-description = "MCP server exposing the LSST DESC cosmology stack (CCL, sacc, firecrown, augur, TXPipe) as agent tools, with HPC dispatch via hep-genesis."
+description = "MCP server exposing the LSST DESC cosmology stack (CCL, sacc, firecrown, augur, TXPipe, TJPCov, NaMaster, Smokescreen) as agent tools, with HPC dispatch via hep-genesis."
 readme = "README.md"
 requires-python = ">=3.12"
 # The DESC packages (pyccl, sacc, firecrown, augur, tjpcov, ceci) are managed by
@@ -31,6 +31,9 @@ tool_modules = [
     "tools.firecrown_tools",
     "tools.augur_tools",
     "tools.txpipe_tools",
+    "tools.tjpcov_tools",
+    "tools.namaster_tools",
+    "tools.smokescreen_tools",
     "mcp_server.dispatch",
 ]
 
