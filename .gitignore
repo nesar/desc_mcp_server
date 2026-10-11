@@ -14,3 +14,7 @@ __pycache__/
 output/
 *.bak
 .DS_Store
+
+# environment built by scripts/env.sh (never committed; rebuild from tools/env/conda-lock.yml)
+.mcp-env/
+.micromamba/

@@ -70,12 +70,27 @@ def test_manifest_has_no_identity_and_env_candidates():
     assert "perlmutter" in env["env_setup_candidates"]
     for name, k in pack["kernels"].items():
         assert "function" in k, name
-        if k["function"] == "envkernel.run_in_env":
+        if k["function"].startswith("inner."):
+            # lock-kernel (contract R8): the pack's environment supplies the stack
+            assert k.get("env_setup_required") is False, name
+            assert "inner" in k and f"tools/inner/{k['inner']}.py" in pack["files"], name
+            assert pack["env_lock"] == "env/conda-lock.yml", name
+        elif k["function"] == "envkernel.run_in_env":
             assert k.get("env_setup_required") is True, name
             assert "inner" in k, name
             assert f"tools/inner/{k['inner']}.py" in pack["files"], name
         else:
             assert "pip_deps" in k, name
+
+
+def test_pack_carries_its_environment():
+    pack = export_dispatch_pack()["dispatch_pack"]
+    assert pack["env_lock"] == "env/conda-lock.yml"
+    assert "tools/env/conda-lock.yml" in pack["files"] and "tools/env/environment.yml" in pack["files"]
+    lock = pack["files"]["tools/env/conda-lock.yml"]
+    assert "version: 1" in lock and "linux-64" in lock
+    assert pack["bytes"] <= 10 * 1024 * 1024
+    assert "env_lock" in pack["usage"] or "conda-lock" in pack["usage"]
 
 
 def test_manifest_documents_walltime_and_timeout():

@@ -63,13 +63,15 @@ CAVEATS = [
 
 DISPATCH_KERNELS = {
     "augur_forecast": {
-        "function": "envkernel.run_in_env",
+        "function": "inner.augur_forecast.main",
         "inner": "augur_forecast",
+        "args_shape": "{'params': <the params object below>}; the pack's env/conda-lock.yml supplies "
+                      "augur + firecrown - no env_setup, no pip_deps (override: function='envkernel.run_in_env')",
         "params": {"config": "<augur config dict with absolute paths>",
                    "mode": "generate | fisher",
                    "inline_files": "{basename: {kind: ascii|npy_b64, data}} n(z) tables / SRD cov",
                    "relocate_outputs": True, "include_bias": None, "max_cov_return": 600},
-        "env_setup_required": True,
+        "env_setup_required": False,
         "suitable_envs": ["desc-python", "desc-cosmology"],
         "duration_hint_s": 1800,
         "returns": "data vector rows, n(z), covariance diagonal, Fisher matrix (nested lists), "
@@ -345,23 +347,24 @@ def _inline_files_for_remote(config: dict) -> dict:
 def _run_forecast_kernel(config: dict, mode: str, env_setup: str | None, duration: int,
                          include_bias=None, max_cov_return: int = 600) -> tuple[dict, str]:
     """Run tools.inner.augur_forecast.main locally or on the active dispatch site."""
-    from mcp_server.dispatch import remote_site, run_env_kernel  # lazy: server-only
+    from mcp_server.dispatch import remote_site, run_env_kernel, run_kernel  # lazy: server-only
 
     site = remote_site()
     params = {"config": copy.deepcopy(config), "mode": mode, "include_bias": include_bias,
               "max_cov_return": max_cov_return}
     if site:
-        if not env_setup or not env_setup.strip():
-            raise ValueError(
-                f"Dispatch is set to {site}: this call needs env_setup, a shell snippet that "
-                "activates a facility environment with augur + firecrown >= 1.14 (see "
-                "export_dispatch_pack -> env_kernel.env_setup_candidates, e.g. the NERSC "
-                "desc-python activation). Nothing is chosen by the server.")
         params["inline_files"] = _inline_files_for_remote(config)
         params["relocate_outputs"] = True
-        res = run_env_kernel(env_setup, "augur_forecast", params, duration=duration)
-        out = res["result"]["result"]
-        out["_env_check"] = res["result"].get("env_check")
+        if env_setup and env_setup.strip():
+            # override: a facility-resident environment named by the client
+            res = run_env_kernel(env_setup, "augur_forecast", params, duration=duration)
+            out = res["result"]["result"]
+            out["_env_check"] = res["result"].get("env_check")
+        else:
+            # default: the pack's own lock environment, built on the node
+            res = run_kernel("inner.augur_forecast.main", {"params": params}, pip_deps=None, duration=duration)
+            out = res["result"]
+            out["_env_check"] = None
         out["_artifact_files"] = res.get("artifact_files")
         return out, str(res.get("host", site))
     from ..inner.augur_forecast import main as _main
@@ -1138,7 +1141,7 @@ def _plot_datavector(rows: list[dict], path: Path, title: str) -> None:
 def augur_generate_synthetic_datavector(
     output_dir: Annotated[str, Field(min_length=1)],
     config_path: Annotated[str, Field(min_length=1, description="Forecast YAML from augur_generate_forecast_config (validated).")],
-    env_setup: Annotated[str | None, Field(description="Facility environment activation (only used when dispatch is remote), e.g. the NERSC desc-python snippet from export_dispatch_pack.")] = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a facility-resident environment instead of the pack's lock environment (built on the node by default). Leave empty.")] = None,
     plot: Annotated[bool, Field(description="Write a PNG of all C_ell with error bars.")] = True,
     duration_s: Annotated[int, Field(ge=120, le=14400, description="Walltime for a remote job.")] = 900,
 ) -> ArtifactResult:
@@ -1242,7 +1245,7 @@ augur_generate_synthetic_datavector.weight = "dispatchable"
 def augur_compute_fisher(
     output_dir: Annotated[str, Field(min_length=1)],
     config_path: Annotated[str, Field(min_length=1, description="Forecast YAML from augur_generate_forecast_config (validated, with a fisher section).")],
-    env_setup: Annotated[str | None, Field(description="Facility environment activation when dispatch is remote (export_dispatch_pack lists candidates); ignored locally.")] = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a facility-resident environment instead of the pack's lock environment (built on the node by default). Leave empty.")] = None,
     include_bias: Annotated[bool | None, Field(description="Compute the Fisher bias when the config has fisher.fisher_bias (None = yes if present).")] = None,
     derived_params: Annotated[bool, Field(description="Also report sigma(Omega_m) and sigma(S8) by linear propagation when Omega_c / sigma8 are varied.")] = True,
     duration_s: Annotated[int, Field(ge=300, le=28800, description="Walltime for a remote job (2n+1 evaluations; eisenstein_hu ~1 s each for 3x2pt Y1, CAMB ~5 s).")] = 1800,

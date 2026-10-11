@@ -39,18 +39,21 @@ PACK_ROOT = str(Path(__file__).resolve().parents[1])
 ENV_SETUP_CANDIDATES = {
     "perlmutter": [
         {
-            "name": "desc-python",
-            "env_setup": "source /global/common/software/lsst/common/miniconda/setup_current_python.sh",
-            "provides": "firecrown 1.15, pyccl 3.3.6, sacc 2.4, tjpcov 0.5.1, numcosmo 0.27 (DESC-maintained, lock 2026-09)",
-            "suitable_for": ["firecrown", "augur", "ccl", "sacc"],
-            "reference": "https://github.com/LSSTDESC/desc-python",
-        },
-        {
             "name": "desc-cosmology",
             "env_setup": "source $CFS/lsst/groups/MCP/setup-cosmology.sh",
-            "provides": "firecrown, augur, pyccl, sacc, tjpcov, cosmosis, namaster, mpi4py (DESC MCP working group env)",
+            "provides": "firecrown 1.14.3, augur, pyccl, sacc, tjpcov, cosmosis, namaster, mpi4py (DESC MCP working group env)",
             "suitable_for": ["firecrown", "augur", "ccl", "sacc"],
             "reference": "https://github.com/LSSTDESC/desc-cosmology-env",
+            "status": "verified 2026-10-09: firecrown chain kernel imports and runs",
+        },
+        {
+            "name": "desc-python",
+            "env_setup": "source /global/common/software/lsst/common/miniconda/setup_current_python.sh",
+            "provides": "firecrown, pyccl 3.3.6, sacc 2.4, tjpcov 0.5.1, numcosmo 0.27 (DESC-maintained)",
+            "suitable_for": ["firecrown", "augur", "ccl", "sacc"],
+            "reference": "https://github.com/LSSTDESC/desc-python",
+            "status": "BROKEN 2026-10-09: its firecrown (0.0.0) imports a missing 'crow' module; "
+                      "try desc-cosmology first",
         },
         {
             "name": "user TXPipe env",

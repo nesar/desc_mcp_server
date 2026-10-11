@@ -33,7 +33,7 @@ desc-mcp-server/
   pyproject.toml            [tool.mcp-server] tool_modules list; deps: mcp[cli], pydantic, numpy, scipy, matplotlib, pyyaml
   README.md                 quick start, tool table, skills, hosting, HPC, EXAMPLE QUERIES
   ENVIRONMENT.md            how desc-mcp is built; version pins and why; TXPipe/NERSC env notes
-  scripts/setup_env.sh      creates conda env desc-mcp (conda-forge, override-channels)
+  scripts/env.sh            micromamba + .mcp-env/ from tools/env/conda-lock.yml (server AND node env)
   mcp_server/               __init__, __main__, cli.py, server.py, dispatch.py  (copied/adapted from template)
   tools/
     common.py               ArtifactResult, write_csv/read_csv, get_cached, param_slug, summary_stats (template) + z<->a, h-unit helpers
@@ -102,6 +102,7 @@ formula — for sacc files that lack a covariance, e.g. TXPipe `twopoint_data_*.
 | `run_firecrown_chain` | H | Cobaya MCMC in PURE_CCL mode (no theory block); dispatch; returns chain + summary. `walltime_s` (default ~5 s/sample, capped 12 h), `resume`, local `background`, `dark_energy_model` auto-PPF when w(a) can cross -1 |
 | `firecrown_chain_status` | L | poll a running/finished chain: samples so far, acceptance, R-1 from `.progress`, background process state |
 | `firecrown_plot_chain` | L | posterior summary after burn-in + getdist corner plot + trace from any Cobaya chain file |
+| `firecrown_chain_cancel` | L | stop a background chain (the chat Stop button cannot reach a server subprocess) |
 
 ### augur_tools (6) — augur 1.2.4, env-kernel dispatch
 `list_augur_examples`, `generate_forecast_config` (Y1/Y10, probes, bins, ndens, sigma_e, ell binning,
@@ -162,7 +163,7 @@ agent ──MCP──> desc-mcp-server (light env) ──┬── local: tools 
 |---|---|---|
 | Facility choice (`polaris` / `perlmutter`) | client (`set_dispatch` on its facility server, or the server's own `set_dispatch` in server-side mode) | server defaults |
 | IRI token, Globus transfer token, Globus endpoint | client's hep-genesis sign-in (`~/.globus` on the client machine) | server |
-| Project / allocation, workdir, QoS, queue | client's hep-genesis `.env` (`NERSC_PROJECT`, `NERSC_WORKDIR`, …) | server code or config |
+| Project / allocation, workdir, QoS, queue | client's hep-genesis `.mcp-env` (`NERSC_PROJECT`, `NERSC_WORKDIR`, …) | server code or config |
 | Facility-side software environment (`env_setup`) | client, as a per-call kernel argument; the pack manifest lists public candidates (e.g. the DESC collaboration env activation script, a `desc-python` kernel, a user's own conda env) | server |
 | Kernels, inner scripts, TXPipe + ceci python sources | this server's `tools/` pack (`export_dispatch_pack`) | — |
 
@@ -174,7 +175,7 @@ agent ──MCP──> desc-mcp-server (light env) ──┬── local: tools 
 - *Server-side (server on the user's own machine)*: `set_dispatch("perlmutter")` routes the heavy tools
   through `run_codes_on_perlmutter(function, args, codes=TOOLS_DIR, pip_deps, duration)` in-process;
   `auth_status` reports the user's sign-in. Facility settings still come from the user's hep-genesis
-  `.env`, which the engine loads; the server passes nothing of its own.
+  `.mcp-env`, which the engine loads; the server passes nothing of its own.
 
 **env-kernel contract** (`tools/envkernel.py`, stdlib only so it runs under any module python)
 
@@ -216,7 +217,7 @@ costs queue time.
 
 ## 6. Environment plan
 
-`scripts/setup_env.sh` creates `desc-mcp` (python 3.12, conda-forge with `--override-channels`):
+`scripts/env.sh` builds `.mcp-env/` from `tools/env/conda-lock.yml` (python 3.12, conda-forge only; the lock also builds the node environment for dispatched jobs). The original recipe was:
 `pyccl>=3.3.1 sacc>=2.4 firecrown>=1.16 lsstdesc-ceci tjpcov lsstdesc-crow qp-prob healpy numdifftools
 jinja2 "camb<2" "numpy>=2,<2.4" matplotlib h5py astropy pyyaml` + pip `mcp[cli] pydantic cobaya derivkit`
 + `pip install --no-deps -e augur` (clone, 1.2.4) + optional `pip install -e <hep-genesis>/backend[iri]`.

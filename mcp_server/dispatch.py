@@ -19,14 +19,16 @@ node, and results come back. Facility settings (project, workdir, tokens)
 come from the USER's hep-genesis .env and sign-in - never from this server.
 Do not use server-side mode on shared/hosted deployments.
 
-Two kernel styles ship in the pack:
-- pip-kernels (tools/ccl/kernels.py): pure pyccl, node-side deps installed
-  by the engine from pip (`pyccl`, `camb` wheels).
-- env-kernels (tools/envkernel.py + tools/inner/*): everything that needs the
-  conda-only DESC stack (firecrown, augur, TXPipe). The kernel runs under the
-  facility's module python and launches the inner script under an
-  environment the CLIENT names in the `env_setup` argument (public candidates
-  are listed in the manifest; nothing is chosen by the server).
+The pack carries its own environment (hep-genesis dispatch contract R8):
+``tools/env/conda-lock.yml`` is the exact environment this server runs in,
+and the engine builds it on the compute node with micromamba (once per lock,
+then reused), so every kernel - pyccl grids, firecrown chains, augur
+forecasts - runs under the same package versions as the server. Nothing
+needs to pre-exist on the facility. Two ways a kernel can still run under a
+facility-resident environment instead: the client passes `env_setup` to a
+tool (the env-kernel path, tools/envkernel.py + tools/inner/*), or
+run_pack_kernel(env_lock="none"). TXPipe tools are env_setup-only (TXPipe
+pins an older firecrown and cannot share the lock).
 
 No SLURM/PBS scripts and no SSH anywhere: the engine generates the job
 wrapper and submits it through the IRI compute API.
@@ -41,6 +43,10 @@ import os
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
+# The environment the pack carries (relative to tools/); the engine ships and
+# builds it by default (hep_genesis.iri.dispatch.envsetup.ENV_LOCK_RELPATH).
+ENV_LOCK = "env/conda-lock.yml"
+ENV_FILES = ("env/conda-lock.yml", "env/environment.yml")
 
 _state = {"site": "local"}
 
@@ -86,7 +92,8 @@ def export_dispatch_pack() -> dict:
     """
     files: dict[str, str] = {}
     total = 0
-    for path in sorted(TOOLS_DIR.rglob("*.py")):
+    env_paths = [TOOLS_DIR / rel for rel in ENV_FILES if (TOOLS_DIR / rel).is_file()]
+    for path in sorted(TOOLS_DIR.rglob("*.py")) + env_paths:
         rel = path.relative_to(TOOLS_DIR)
         if any(part.startswith((".", "__pycache__")) for part in rel.parts):
             continue
@@ -109,6 +116,13 @@ def export_dispatch_pack() -> dict:
             "bytes": total,
             "files": files,
             "kernels": _collect_kernel_manifest(),
+            # contract R8: the lock IS the node environment; the engine detects
+            # it at this path and builds it (micromamba) before the kernel runs
+            "env_lock": ENV_LOCK if f"tools/{ENV_LOCK}" in files else None,
+            "env_lock_note": "Pass no env_setup and no pip_deps: run_pack_kernel builds the "
+                             "environment from this lock on the facility (first job with a new "
+                             "lock: minutes; later jobs reuse it). env_setup remains an override "
+                             "for a facility-resident environment (TXPipe needs it).",
             "env_kernel": {
                 "function": "envkernel.run_in_env",
                 "args": {"env_setup": "<shell snippet activating a facility env with the DESC stack>",
@@ -128,9 +142,11 @@ def export_dispatch_pack() -> dict:
             "usage": (
                 "Save these files on the CLIENT machine, then dispatch with the "
                 "hep-genesis facility server: run_pack_kernel(pack=<saved dir>/tools, "
-                "function=<kernel function>, args={...}, pip_deps=<kernel pip deps or []>, "
-                "duration=<walltime s>). For env-kernels pass function='envkernel.run_in_env' with "
-                "args={env_setup, inner, params, timeout_s} and the same walltime as duration."
+                "function=<kernel function>, args={...}, duration=<walltime s>) - no pip_deps, "
+                "no env_setup: the pack's env/conda-lock.yml is built on the node. Inner scripts "
+                "run directly as function='inner.<name>.main' with args={params: {...}}. Only to use a "
+                "facility-resident environment instead: function='envkernel.run_in_env' with "
+                "args={env_setup, inner, params, timeout_s}, env_lock='none'."
             ),
         }
     }
@@ -177,6 +193,8 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
         raise RuntimeError("run_kernel called with local dispatch - use the kernel directly.")
     run = _engine()[site]
     try:
+        # codes=tools/ ships env/conda-lock.yml with the kernels; the engine
+        # builds that environment on the node (env_lock auto-detected).
         result = run(function=function, args=args, codes=str(TOOLS_DIR),
                      pip_deps=pip_deps, duration=duration, nodes=nodes)
     except Exception as exc:
@@ -274,8 +292,11 @@ def set_dispatch(site: str, artifact_dir: str | None = None) -> str:
         f"Dispatch: remote on {site} ({facility}) - heavy tools will stage this "
         "server's kernels, submit via IRI, and fetch results back. Each call is "
         "one facility job (minutes to hours; the call stays alive with progress "
-        f"heartbeats). {caps}. Tools needing the DESC stack on the node take "
-        f"env_setup - candidates: {candidates}."
+        f"heartbeats). {caps}. The node runs the pack's own environment "
+        "(tools/env/conda-lock.yml, built once on the facility with micromamba - the "
+        "first job after a lock change takes minutes longer), so no env_setup is "
+        f"needed; env_setup is an optional override to a facility environment "
+        f"(TXPipe needs one) - candidates: {candidates}."
     )
 
 

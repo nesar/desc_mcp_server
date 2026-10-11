@@ -17,6 +17,10 @@ params (JSON):
   resume          : bool  continue from the Cobaya checkpoint of a previous run
                           with the same prefix (walltime-bounded chains); the
                           sampler settings must match that run
+  file_locking    : bool  Cobaya's portalocker output lock (default True). Set
+                          False on filesystems without POSIX locks - NERSC CFS
+                          raises OSError errno 524 - the wrapper does so for
+                          every facility run.
 
 returns: {"chain_files": [...], "n_samples", "acceptance_rate", "summary":
           {name: {"mean", "std", "lower68", "upper68"}}, "sampled": [...],
@@ -70,6 +74,9 @@ def main(params: dict) -> dict:
     prefix = str(params.get("chain_prefix") or "chain")
     seed = params.get("seed")
     resume = bool(params.get("resume", False))
+    if not params.get("file_locking", True):
+        # must be set before cobaya.output is imported (read at lock time)
+        os.environ["COBAYA_USE_FILE_LOCKING"] = "False"
     os.makedirs(work_dir, exist_ok=True)
 
     # cheap check that the experiment loads and learn the required names

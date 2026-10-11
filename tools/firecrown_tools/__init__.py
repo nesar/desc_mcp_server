@@ -28,7 +28,7 @@ from ..cosmology import CosmologyParams
 
 __all__ = ["firecrown_list_examples", "firecrown_build_likelihood", "firecrown_compute_loglike",
            "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain",
-           "firecrown_chain_status", "firecrown_plot_chain"]
+           "firecrown_chain_status", "firecrown_plot_chain", "firecrown_chain_cancel"]
 
 CONVENTIONS = {
     "parameter_names": "firecrown == pyccl: Omega_c Omega_b h n_s sigma8|A_s Omega_k Neff m_nu[eV] w0 wa T_CMB; "
@@ -88,28 +88,34 @@ _PARAMS_BY_FACTORY = {
 
 DISPATCH_KERNELS = {
     "firecrown_loglike": {
-        "function": "envkernel.run_in_env", "inner": "firecrown_loglike",
+        "function": "inner.firecrown_loglike.main", "inner": "firecrown_loglike",
+        "args_shape": "{'params': <the params object below>}; the pack's env/conda-lock.yml supplies "
+                      "firecrown - no env_setup, no pip_deps (override: function='envkernel.run_in_env')",
         "params": {"experiment_yaml": "<path or inline via experiment_yaml_text + sacc_b64/sacc_remote_path>",
                    "points": [{"Omega_c": 0.25, "sigma8": 0.81, "lens0_bias": 1.4}],
                    "return_vectors": True, "per_statistic": True},
-        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+        "env_setup_required": False, "suitable_envs": ["desc-cosmology", "desc-python"],
         "duration_hint_s": 1800,
         "returns": "required params with defaults, n_data, per-point loglike/chi2/per-statistic chi2, theory/data vectors",
     },
     "firecrown_theory": {
-        "function": "envkernel.run_in_env", "inner": "firecrown_theory",
+        "function": "inner.firecrown_theory.main", "inner": "firecrown_theory",
+        "args_shape": "{'params': <the params object below>}; the pack's env/conda-lock.yml supplies "
+                      "firecrown - no env_setup, no pip_deps (override: function='envkernel.run_in_env')",
         "params": {"experiment_yaml": "<path>", "params": {}, "write_sacc": True, "add_noise": False,
                    "seed": None, "sacc_output": "theory_realization.hdf5"},
-        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+        "env_setup_required": False, "suitable_envs": ["desc-cosmology", "desc-python"],
         "duration_hint_s": 1800,
         "returns": "theory/data/sigma per statistic and the realization sacc path (job CWD)",
     },
     "firecrown_chain": {
-        "function": "envkernel.run_in_env", "inner": "firecrown_chain",
+        "function": "inner.firecrown_chain.main", "inner": "firecrown_chain",
+        "args_shape": "{'params': <the params object below>}; the pack's env/conda-lock.yml supplies "
+                      "firecrown - no env_setup, no pip_deps (override: function='envkernel.run_in_env')",
         "params": {"experiment_yaml": "<path>", "fixed": {}, "priors": {"sigma8": {"min": 0.6, "max": 1.0}},
                    "max_samples": 2000, "rminus1_stop": 0.05, "work_dir": ".", "chain_prefix": "chain",
-                   "resume": False},
-        "env_setup_required": True, "suitable_envs": ["desc-python", "desc-cosmology"],
+                   "resume": False, "file_locking": False},
+        "env_setup_required": False, "suitable_envs": ["desc-cosmology", "desc-python"],
         "duration_hint_s": 7200,
         "duration_note": "request ~5 s per sample as the job walltime (duration=), at most the facility's "
                          "long-queue cap (Perlmutter regular 12 h); pass the same value minus 60 s as "
@@ -186,20 +192,21 @@ def _remote_params(exp_path: Path, sacc_remote_path: str | None) -> dict:
 def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: int,
                exp_path: Path, sacc_remote_path: str | None = None) -> tuple[dict, str]:
     """Local in-process call or remote env-kernel; returns (result, computed_on)."""
-    from mcp_server.dispatch import remote_site, run_env_kernel  # lazy: server-only
+    from mcp_server.dispatch import remote_site, run_env_kernel, run_kernel  # lazy: server-only
 
     site = remote_site()
     if site:
-        if not env_setup:
-            raise ValueError(
-                f"Dispatch is set to {site}: this call needs env_setup (a shell snippet activating a "
-                "facility environment with firecrown >= 1.14, e.g. the NERSC desc-python stack; see "
-                "export_dispatch_pack's env_setup_candidates).")
         p = dict(params)
         p.pop("experiment_yaml", None)
         p.update(_remote_params(exp_path, sacc_remote_path))
-        res = run_env_kernel(env_setup, inner_name, p, duration=duration)
-        return res["result"]["result"], res.get("host", site)
+        if env_setup and env_setup.strip():
+            # override: a facility-resident environment named by the client
+            res = run_env_kernel(env_setup, inner_name, p, duration=duration)
+            return res["result"]["result"], res.get("host", site)
+        # default: the pack's own environment (tools/env/conda-lock.yml), built
+        # on the node by the engine; the inner script runs as a plain kernel
+        res = run_kernel(f"inner.{inner_name}.main", {"params": p}, pip_deps=None, duration=duration)
+        return res["result"], res.get("host", site)
     import importlib
 
     _load_local(exp_path)  # warm/refresh the in-process cache
@@ -568,7 +575,7 @@ def firecrown_compute_loglike(
     cosmology: Annotated[CosmologyParams | None, Field(description="Cosmology (None = vanilla LCDM: Omega_c 0.25, Omega_b 0.05, h 0.67, n_s 0.96, sigma8 0.81).")] = None,
     nuisance: Annotated[dict[str, float], Field(description="Nuisance values by firecrown name (lens0_bias, src0_delta_z, src0_mult_bias, ia_bias, ...); unspecified mult_bias/ia_bias/delta_z take NEUTRAL values (0; no systematic), other unspecified ones firecrown's defaults (e.g. {tracer}_bias 1.5) - see metadata.warnings.")] = {},
     plot: Annotated[bool, Field(description="Write a theory-vs-data PNG per statistic.")] = True,
-    env_setup: Annotated[str | None, Field(description="Only when dispatch is remote: facility environment activation snippet.")] = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a shell snippet activating a facility-resident environment to use INSTEAD of the pack's own lock environment (which the engine builds on the node by default). Leave empty.")] = None,
     sacc_remote_path: Annotated[str | None, Field(description="Remote runs only: facility path of the sacc file (else it is shipped inline).")] = None,
 ) -> ArtifactResult:
     """Evaluate the firecrown log-likelihood, chi2 and per-statistic chi2 of an experiment at one cosmology + nuisance point.
@@ -666,7 +673,7 @@ def firecrown_theory_data_vector(
     seed: Annotated[int | None, Field(ge=0, description="Seed for the noisy draw.")] = None,
     output_format: Literal["hdf5", "fits"] = "hdf5",
     plot: bool = True,
-    env_setup: str | None = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a facility-resident environment instead of the pack's lock environment. Leave empty.")] = None,
     sacc_remote_path: str | None = None,
 ) -> ArtifactResult:
     """Compute the theory data vector of an experiment and optionally write it as a new (noiseless or noisy) sacc realization.
@@ -770,7 +777,7 @@ def firecrown_scan_loglike(
     cosmology: Annotated[CosmologyParams | None, Field(description="Fixed cosmology for the other parameters.")] = None,
     nuisance: Annotated[dict[str, float], Field(description="Fixed nuisance values.")] = {},
     plot: bool = True,
-    env_setup: str | None = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a facility-resident environment instead of the pack's lock environment. Leave empty.")] = None,
     sacc_remote_path: str | None = None,
 ) -> ArtifactResult:
     """Profile the log-likelihood along one parameter (all others fixed) and report the chi2 minimum and 1-sigma crossing.
@@ -925,6 +932,27 @@ def _experiment_with_dark_energy_model(exp_path: Path, model: str) -> Path:
     out = exp_path.with_name(f"{exp_path.stem}_{model}.yaml")
     out.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
     return out
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while *pid* runs. A background chain is this server's child: once
+    it exits it lingers as a zombie that still answers ``kill(pid, 0)``, so
+    reap it first (waitpid raises for processes that are not our children)."""
+    import os as _os
+
+    try:
+        done, _ = _os.waitpid(pid, _os.WNOHANG)
+        if done == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+    try:
+        _os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _read_chain(chain_txt: Path) -> tuple[list[str], np.ndarray]:
@@ -1084,7 +1112,7 @@ def firecrown_run_chain(
     seed: Annotated[int | None, Field(ge=0)] = None,
     chain_prefix: Annotated[str, Field(min_length=1)] = "chain",
     plot: Annotated[bool, Field(description="Trace plot of the sampled parameters (needs the chain file locally).")] = True,
-    env_setup: Annotated[str | None, Field(description="Required when dispatch is remote: facility environment activation (must provide firecrown + cobaya).")] = None,
+    env_setup: Annotated[str | None, Field(description="Remote runs only, OPTIONAL override: a shell snippet activating a facility-resident environment to use INSTEAD of the pack's own lock environment (which the engine builds on the node by default). Leave empty.")] = None,
     sacc_remote_path: str | None = None,
     walltime_s: Annotated[int | None, Field(ge=300, le=86400, description="Walltime of the facility job / timeout of a local run, seconds. Default: ~5 s per sample, clamped to [30 min, 12 h] (the Perlmutter regular-QOS cap; jobs over 30 min route to that QOS). Size max_samples to it, or continue a stopped chain with resume=True.")] = None,
     resume: Annotated[bool, Field(description="Continue a chain with the same prefix/arguments from its Cobaya checkpoint (a run that hit its walltime or max_samples) instead of starting over.")] = False,
@@ -1125,6 +1153,15 @@ def firecrown_run_chain(
             raise ValueError(f"prior for {k} needs min < max: {spec_}")
     point, warns = _check_point(required, cosmology, nuisance, exp_path)
     fixed = {k: v for k, v in point.items() if k not in priors}
+    # CAMB (fluid AND ppf) requires w0 + wa < 0 (w(a) < 0 at early times):
+    # a prior box reaching w0 + wa >= 0 kills the chain hours in (229 samples
+    # then "w0+wa > 0", 2026-10-09). Check the box corner up front.
+    w0_max = float(priors["w0"]["max"]) if "w0" in priors else float(fixed.get("w0", -1.0))
+    wa_max = float(priors["wa"]["max"]) if "wa" in priors else float(fixed.get("wa", 0.0))
+    if w0_max + wa_max >= 0.0:
+        raise ValueError(f"CAMB requires w0 + wa < 0 everywhere in the prior box, but max(w0) + max(wa) = "
+                         f"{w0_max:g} + {wa_max:g} = {w0_max + wa_max:g}. Tighten the priors (e.g. w0 in "
+                         "[-1.5, -0.5], wa in [-1.5, 0.5]) so the corner stays below 0.")
     if dark_energy_model == "auto":
         dark_energy_model = "ppf" if _needs_ppf(priors, fixed) else "fluid"
     if dark_energy_model == "ppf":
@@ -1142,7 +1179,9 @@ def firecrown_run_chain(
     work_dir = str(outdir) if not site else "."
     params = {"fixed": fixed, "priors": {k: as_float_dict(v) for k, v in priors.items()},
               "max_samples": max_samples, "rminus1_stop": rminus1_stop, "work_dir": work_dir,
-              "chain_prefix": prefix, "seed": seed, "resume": resume}
+              "chain_prefix": prefix, "seed": seed, "resume": resume,
+              # facility job dirs (NERSC CFS) have no POSIX locks: errno 524
+              "file_locking": not site}
     settings = {"sampler": "mcmc", "max_samples": max_samples, "rminus1_stop": rminus1_stop, "seed": seed,
                 "creation_mode": "pure_ccl_mode", "dark_energy_model": dark_energy_model,
                 "walltime_s": walltime, "estimated_seconds": est_s, "resume": resume}
@@ -1204,7 +1243,6 @@ def firecrown_chain_status(
     status, error, log_tail, result_path = "not_started", None, None, None
     if bg is not None:
         import json as _json
-        import os as _os
 
         info = _json.loads(bg.read_text(encoding="utf-8"))
         result_path = info.get("result_path")
@@ -1216,11 +1254,9 @@ def firecrown_chain_status(
             status = "finished" if out.get("ok") else "failed"
             error = None if out.get("ok") else (out.get("error") or "")[-1200:]
         else:
-            alive = False
             try:
-                _os.kill(int(info["pid"]), 0)
-                alive = True
-            except (OSError, KeyError, ValueError):
+                alive = _pid_alive(int(info["pid"]))
+            except (KeyError, ValueError):
                 alive = False
             status = "running" if alive else ("failed" if n_lines == 0 else "stopped")
             if not alive and not error:
@@ -1234,7 +1270,8 @@ def firecrown_chain_status(
                  + (f"; last checkpoint N={last['N']}, acceptance {last['acceptance_rate']:.2f}, "
                     f"R-1 = {last['Rminus1']:.3g}" if last else "; no checkpoint yet")
                  + (f". Error: {error[:200]}" if error else "")
-                 + (". Next: firecrown_plot_chain on this chain file." if status in ("finished", "stopped") else "")),
+                 + (". Next: firecrown_plot_chain on this chain file." if status in ("finished", "stopped") else "")
+                 + (". Stop it with firecrown_chain_cancel." if status == "running" and bg is not None else "")),
         metadata={"status": status, "n_samples": n_lines, "progress": progress, "locked": locked,
                   "chain_txt": str(chain), "result_path": result_path, "error": error, "log_tail": log_tail},
     )
@@ -1321,4 +1358,56 @@ def firecrown_plot_chain(
         metadata={"summary": summary, "parameters": names, "n_total": n_total, "n_kept": int(kept.shape[0]),
                   "burn_in_frac": burn_in_frac, "progress": progress, "corner_engine": engine,
                   "chain_txt": str(chain), "warnings": warns},
+    )
+
+
+@validate_call
+def firecrown_chain_cancel(
+    chain_txt: Annotated[str, Field(min_length=1, description="The chain file of a BACKGROUND run (firecrown_run_chain background=True); its background record is found next to it.")],
+) -> ArtifactResult:
+    """Stop a background chain started by firecrown_run_chain(background=True): terminates the detached process (SIGTERM, then SIGKILL after 10 s) and leaves the chain files for firecrown_plot_chain or resume=True.
+
+    The chat's Stop button cannot reach a background chain (it is a
+    subprocess of this server) - call this when the user wants it stopped.
+    Facility jobs are cancelled through the facility server (cancel_job).
+    """
+    import json as _json
+    import os as _os
+    import signal
+    import time as _time
+
+    chain = Path(chain_txt).expanduser()
+    stem = chain.name[:-len(".1.txt")] if chain.name.endswith(".1.txt") else chain.stem
+    bg = next(iter(chain.parent.glob(f"inner_firecrown_chain_{stem}_background.json")), None)
+    if bg is None:
+        raise ValueError(f"no background record for {stem} in {chain.parent}: this chain was not started with "
+                         "background=True (a foreground call ends with its result; facility jobs: cancel_job).")
+    info = _json.loads(bg.read_text(encoding="utf-8"))
+    pid = int(info["pid"])
+
+    def alive() -> bool:
+        return _pid_alive(pid)
+
+    if not alive():
+        return ArtifactResult(status="success", files=[], message=f"Chain {stem} (pid {pid}) was not running.",
+                              metadata={"pid": pid, "was_running": False, "chain_txt": str(chain)})
+    _os.kill(pid, signal.SIGTERM)
+    for _ in range(100):
+        if not alive():
+            break
+        _time.sleep(0.1)
+    killed = False
+    if alive():
+        _os.kill(pid, signal.SIGKILL)
+        killed = True
+        _time.sleep(0.5)
+    n = 0
+    if chain.is_file():
+        with chain.open(encoding="utf-8") as fh:
+            n = sum(1 for line in fh if line.strip() and not line.startswith("#"))
+    return ArtifactResult(
+        status="success", files=[],
+        message=f"Chain {stem} stopped (pid {pid}{', SIGKILL' if killed else ''}); {n} accepted samples kept in "
+                f"{chain.name} - firecrown_plot_chain can summarise them, resume=True continues the chain.",
+        metadata={"pid": pid, "was_running": True, "killed": killed, "n_samples": n, "chain_txt": str(chain)},
     )

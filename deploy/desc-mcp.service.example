@@ -1,0 +1,28 @@
+# systemd unit for a hosted desc-mcp-server (copy to /etc/systemd/system/desc-mcp.service,
+# edit the paths/ports, then: systemctl daemon-reload && systemctl enable --now desc-mcp).
+# The environment comes from `bash scripts/env.sh` run once in the checkout; the same
+# lock builds the compute-node environment for every dispatched job, so no facility
+# tokens or project settings live on this host (client-side handoff).
+[Unit]
+Description=desc-mcp-server (LSST DESC tools over MCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mcp
+WorkingDirectory=/opt/desc-mcp-server
+# streamable-http on localhost; put a TLS reverse proxy (Caddy, nginx) in front
+ExecStart=/opt/desc-mcp-server/.mcp-env/bin/python -m mcp_server --transport streamable-http --port 8008
+Restart=on-failure
+RestartSec=5
+Environment=MCP_PUBLIC=1
+Environment=MCP_OUTPUT_ROOT=/srv/artifacts/desc
+Environment=MCP_ARTIFACT_URL=https://files.example.org/desc
+# progress heartbeat period for heavy tools (seconds)
+Environment=MCP_HEARTBEAT_S=30
+# writable caches for the service user (astropy, matplotlib, pip)
+Environment=HOME=/var/lib/desc-mcp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

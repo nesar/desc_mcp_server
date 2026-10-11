@@ -1,0 +1,51 @@
+# The desc-mcp-server environment, source of truth for `conda-lock.yml` next to it.
+#
+# One environment for everything: the MCP server process (laptop, hosted VM) and the
+# compute-node side of every dispatched job (the lock travels inside the dispatch pack
+# and the hep-genesis engine builds it on the facility with micromamba). conda-forge only;
+# never mix in `defaults`. Edit this file, then `bash scripts/env.sh --relock`.
+#
+# Not here on purpose: isitgr (firecrown's optional mu-Sigma MG backend: no conda build for
+# macOS arm64 - `pip install isitgr` by hand if you need it), TXPipe (pins firecrown 1.7, runs in its own env via env_setup),
+# the upstream clones (CCL/, augur/, firecrown/, ... are read-only references), and the
+# server package itself (`pip install -e .` by scripts/env.sh after the lock is applied).
+name: desc-mcp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  - numpy>=2.0,<2.4
+  - scipy>=1.13
+  - camb<2.0
+  - pyccl>=3.3.1
+  - sacc>=2.4
+  - firecrown>=1.16
+  - tjpcov>=0.5
+  - namaster
+  - lsstdesc-ceci>=2.4
+  - lsstdesc-crow
+  - qp-prob
+  - healpy
+  - numdifftools
+  - jinja2
+  - cryptography
+  - matplotlib-base
+  - h5py
+  - astropy
+  - pyyaml
+  - getdist
+  - derivkit
+  - portalocker
+  - pytest
+  - anyio
+  - pip:
+      - mcp[cli]>=1.27,<2
+      - pydantic>=2,<3
+      - cobaya
+      - jsonargparse[signatures]>=4.0
+      # the vendored augur clone's commit (1.2.4; conda-forge lags) - same code on every host
+      - augur @ git+https://github.com/LSSTDESC/augur@f8ab7cf
+      # the vendored Smokescreen clone's commit (conda-forge 1.5.6 predates save_concealed_datavector(suffix=))
+      - Smokescreen @ git+https://github.com/LSSTDESC/Smokescreen@beab5af

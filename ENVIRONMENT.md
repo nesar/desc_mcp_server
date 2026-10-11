@@ -1,10 +1,17 @@
 # Environment notes — `desc-mcp`
 
-One conda env (Python 3.12, numpy 2.3) runs the server and every CCL /
-sacc / firecrown / augur tool. Recreate it with `bash scripts/setup_env.sh`;
-validate with `python tests/smoke_env.py` (7 checks) and
-`python -m pytest tests/ -q`. Run both from the repo root, never from inside
-a clone directory (the CCL source tree shadows the installed `pyccl`).
+One environment, defined once, used everywhere: `tools/env/environment.yml`
+is the source, `tools/env/conda-lock.yml` the exact solve for `osx-arm64`
+(laptop) and `linux-64` (hosted VMs and the ALCF/NERSC compute nodes).
+`bash scripts/env.sh` fetches micromamba into `.micromamba/` and creates
+`.mcp-env/` from the lock (no conda on the machine); the same lock ships inside
+the dispatch pack and the hep-genesis engine builds it on the compute node
+(`<WORKDIR>/envs/cl-<hash>`, once per lock). Validate with
+`.mcp-env/bin/python tests/smoke_env.py` and `.mcp-env/bin/python -m pytest tests/ -q`,
+from the repo root, never from inside a clone directory (the CCL source tree
+shadows the installed `pyccl`). To change a version: edit `environment.yml`,
+`bash scripts/env.sh --relock` (needs conda or mamba on PATH for the solve, and
+`uv`), commit both files.
 
 ## What's installed and verified working (2026-10-07, macOS arm64)
 
@@ -80,12 +87,14 @@ Nothing facility-related is configured on the server: no project, user,
 workdir, token, Globus endpoint or environment path. Those belong to the
 client's hep-genesis harness.
 
-## Facility environments (chosen by the user per call, never by the server)
+## Facility environments (optional override; the default is the pack's own lock)
 
-Heavy tools that need the conda-only DESC stack on a compute node take an
+By default no facility environment is involved: the lock above is built on
+the node and every inner script runs in it. Heavy tools still accept an
 `env_setup` argument — a shell snippet run on the node before the inner
-script. Public candidates the server documents (`export_dispatch_pack` →
-`env_kernel.env_setup_candidates`):
+script — to use a facility-resident environment instead (TXPipe pipelines
+need one). Public candidates the server documents (`export_dispatch_pack` →
+`env_kernel.env_setup_candidates`; `desc-python` was broken on 2026-10-09):
 
 | Facility | Candidate | Contains |
 |---|---|---|

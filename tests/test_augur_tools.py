@@ -50,7 +50,9 @@ def test_list_examples_flags_shipped_prior_trap():
     assert ex["srd_y1_3x2.yml"]["cov_type"] == "SRD"
     assert r.metadata["data_files"]["Y1_3x2_SRD_cov.npy"]["shape"] == [540, 540]
     assert CONVENTIONS["kmax"].startswith("Mpc^-1")
-    assert DISPATCH_KERNELS["augur_forecast"]["env_setup_required"] is True
+    # lock-kernel (contract R8): runs in the pack's own environment, env_setup only overrides
+    assert DISPATCH_KERNELS["augur_forecast"]["env_setup_required"] is False
+    assert DISPATCH_KERNELS["augur_forecast"]["function"] == "inner.augur_forecast.main"
     assert len(CAVEATS) >= 5
 
 

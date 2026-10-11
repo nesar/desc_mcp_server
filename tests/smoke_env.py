@@ -128,6 +128,8 @@ def smokescreen_import():
 
 
 if __name__ == "__main__":
+    print(f"python {sys.version.split()[0]} at {sys.executable}"
+          + ("  [the repo's .mcp-env from scripts/env.sh]" if "/.mcp-env/" in sys.executable else ""))
     check("versions", versions)
     check("ccl P(k)", ccl_pk)
     check("sacc write", sacc_io)

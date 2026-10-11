@@ -149,7 +149,8 @@ def test_inner_kernel_json_roundtrip(experiment, work, tmp_path, monkeypatch):
     assert res["n_data"] == 457 and math.isfinite(res["results"][0]["loglike"])
     assert "lens0_bias" in res["required"]
     for k in ("firecrown_loglike", "firecrown_theory", "firecrown_chain"):
-        assert DISPATCH_KERNELS[k]["env_setup_required"] and DISPATCH_KERNELS[k]["inner"] == k
+        assert DISPATCH_KERNELS[k]["env_setup_required"] is False and DISPATCH_KERNELS[k]["inner"] == k
+        assert DISPATCH_KERNELS[k]["function"] == f"inner.{k}.main"
         assert "desc-python" in DISPATCH_KERNELS[k]["suitable_envs"]
 
 
@@ -186,7 +187,7 @@ def test_chain_walltime_policy():
 def test_run_chain_auto_ppf_w0wa(experiment, work):
     pytest.importorskip("cobaya")
     r = firecrown_run_chain(output_dir=str(work / "chain_ppf"), experiment_yaml=experiment.metadata["experiment_yaml"],
-                            priors={"w0": {"min": -1.6, "max": -0.6}, "wa": {"min": -1.0, "max": 1.0}},
+                            priors={"w0": {"min": -1.6, "max": -0.6}, "wa": {"min": -1.0, "max": 0.5}},
                             nuisance=FIDUCIAL, max_samples=4, seed=2, plot=False)
     m = r.metadata
     assert m["cobaya_settings"]["dark_energy_model"] == "ppf"
@@ -248,3 +249,64 @@ def test_run_chain_resume_requires_existing_chain(experiment, work):
         firecrown_run_chain(output_dir=str(work / "chain_none"), experiment_yaml=experiment.metadata["experiment_yaml"],
                             priors={"sigma8": {"min": 0.6, "max": 1.0}}, nuisance=FIDUCIAL,
                             max_samples=4, seed=9, resume=True)
+
+
+def test_run_chain_rejects_w0_wa_corner(experiment, work):
+    with pytest.raises(ValueError, match="w0 \\+ wa < 0"):
+        firecrown_run_chain(output_dir=str(work / "chain_bad"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"w0": {"min": -2, "max": -0.3}, "wa": {"min": -3, "max": 1}},
+                            nuisance=FIDUCIAL, max_samples=4)
+
+
+def test_background_chain_cancel(experiment, work):
+    pytest.importorskip("cobaya")
+    import time
+
+    from tools.firecrown_tools import firecrown_chain_cancel, firecrown_chain_status
+
+    r = firecrown_run_chain(output_dir=str(work / "chain_cancel"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            priors={"sigma8": {"min": 0.6, "max": 1.0}}, nuisance=FIDUCIAL,
+                            max_samples=5000, seed=4, background=True)
+    chain_txt = r.metadata["chain_txt"]
+    time.sleep(2)
+    assert firecrown_chain_status(chain_txt=chain_txt).metadata["status"] == "running"
+    c = firecrown_chain_cancel(chain_txt=chain_txt)
+    assert c.metadata["was_running"] is True
+    st = firecrown_chain_status(chain_txt=chain_txt).metadata
+    assert st["status"] in ("stopped", "failed")
+    assert firecrown_chain_cancel(chain_txt=chain_txt).metadata["was_running"] is False
+    with pytest.raises(ValueError):
+        firecrown_chain_cancel(chain_txt=str(work / "nope.1.txt"))
+
+
+def test_inner_chain_file_locking_switch(experiment, work, monkeypatch):
+    pytest.importorskip("cobaya")
+    import os
+
+    from tools.inner import firecrown_chain as inner
+
+    monkeypatch.delenv("COBAYA_USE_FILE_LOCKING", raising=False)
+    inner.main({"experiment_yaml": experiment.metadata["experiment_yaml"], "fixed": FIDUCIAL,
+                "priors": {"sigma8": {"min": 0.6, "max": 1.0}}, "max_samples": 4, "seed": 5,
+                "work_dir": str(work / "chain_nolock"), "chain_prefix": "nolock", "file_locking": False})
+    assert os.environ.get("COBAYA_USE_FILE_LOCKING") == "False"
+    assert (work / "chain_nolock" / "nolock.1.txt").is_file()
+
+
+def test_remote_routing_lock_kernel_vs_env_setup(experiment, monkeypatch):
+    """Remote: no env_setup -> the inner script runs as a lock-kernel; env_setup -> env-kernel."""
+    from mcp_server import dispatch as d
+    from tools.firecrown_tools import _run_inner
+
+    calls = []
+    monkeypatch.setattr(d, "remote_site", lambda: "perlmutter")
+    monkeypatch.setattr(d, "run_kernel", lambda fn, args, **kw: (calls.append(("lock", fn, kw)) or
+                        {"result": {"ok": 1}, "host": "nid001"}))
+    monkeypatch.setattr(d, "run_env_kernel", lambda env, inner, params, **kw: (calls.append(("env", inner, env)) or
+                        {"result": {"result": {"ok": 2}}, "host": "nid002"}))
+    exp = Path(experiment.metadata["experiment_yaml"])
+    res, host = _run_inner("firecrown_loglike", {"points": []}, None, 600, exp, None)
+    assert res == {"ok": 1} and host == "nid001" and calls[-1][:2] == ("lock", "inner.firecrown_loglike.main")
+    assert calls[-1][2]["pip_deps"] is None and calls[-1][2]["duration"] == 600
+    res, host = _run_inner("firecrown_loglike", {"points": []}, "source /x/env.sh", 600, exp, None)
+    assert res == {"ok": 2} and host == "nid002" and calls[-1][:2] == ("env", "firecrown_loglike")

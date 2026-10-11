@@ -28,19 +28,22 @@ Companion documents:
 ## Quick start
 
 ```bash
-bash scripts/setup_env.sh                 # creates conda env "desc-mcp" (~3 min, conda-forge only)
-conda activate desc-mcp
-python tests/smoke_env.py                 # 10 environment checks
-python -m pytest tests/ -q                # in-process tool tests
-python tests/smoke_server.py              # every family through a live MCP session
-python -m mcp_server                      # stdio transport
-python -m mcp_server --transport streamable-http --port 8000   # HTTP
+bash scripts/env.sh                       # micromamba + .mcp-env/ from tools/env/conda-lock.yml (~5 min), then 10 env checks
+.mcp-env/bin/python -m pytest tests/ -q       # in-process tool tests
+.mcp-env/bin/python tests/smoke_server.py     # every family through a live MCP session
+.mcp-env/bin/python -m mcp_server             # stdio transport
+.mcp-env/bin/python -m mcp_server --transport streamable-http --port 8000   # HTTP
 ```
+
+No conda needed: the environment is the exact set of versions in
+`tools/env/conda-lock.yml` (source: `tools/env/environment.yml`; change it and
+run `bash scripts/env.sh --relock`). The same lock ships inside the dispatch
+pack and is built on the compute node, so what runs here runs there.
 
 Register with Claude Code / Claude Desktop (stdio, local):
 
 ```bash
-claude mcp add desc -- $(conda info --base)/envs/desc-mcp/bin/python -m mcp_server
+claude mcp add desc -- $(pwd)/.mcp-env/bin/python -m mcp_server
 ```
 
 (Claude Desktop: add the same command and args to `claude_desktop_config.json`,
@@ -55,7 +58,7 @@ hep-genesis-agent desktop app's server list — at the HTTP endpoint
 | meta | `list_desc_packages`, `describe_desc_tool_family`, `list_desc_skills`, `load_desc_skill`, `convert_cosmology_names` | registry + skills + name maps |
 | ccl | `ccl_describe_cosmology`, `ccl_background`, `ccl_matter_pk`, `ccl_lsst_srd_nz`, `ccl_angular_cls`, `ccl_correlation_functions`, `ccl_correlation_3d`, `ccl_halo_mass_function`, `ccl_halo_model_pk`, `ccl_baryon_boost` | pyccl 3.3.6 (+ CAMB, CosmicEmu, bacco, HMcode) |
 | sacc | `sacc_inspect`, `sacc_to_csv`, `sacc_prepare_for_firecrown`, `sacc_attach_gaussian_covariance` | sacc 2.4 (+ pyccl for the Gaussian covariance) |
-| firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain`, `firecrown_chain_status`, `firecrown_plot_chain` | firecrown 1.16 factory API, Cobaya (pure-CCL mode; background runs, resume, auto-PPF for w0-wa), getdist corner plots |
+| firecrown | `firecrown_list_examples`, `firecrown_build_likelihood`, `firecrown_compute_loglike`, `firecrown_theory_data_vector`, `firecrown_scan_loglike`, `firecrown_run_chain`, `firecrown_chain_status`, `firecrown_plot_chain`, `firecrown_chain_cancel` | firecrown 1.16 factory API, Cobaya (pure-CCL mode; background runs, resume, auto-PPF for w0-wa), getdist corner plots |
 | augur | `augur_list_examples`, `augur_generate_forecast_config`, `augur_validate_forecast_config`, `augur_generate_synthetic_datavector`, `augur_compute_fisher`, `augur_plot_fisher_contours` | augur 1.2.4 (+ TJPCov, numdifftools / derivkit) |
 | txpipe | `txpipe_list_stages`, `txpipe_describe_stage`, `txpipe_list_examples`, `txpipe_generate_pipeline`, `txpipe_validate_pipeline`, `txpipe_run_pipeline`, `txpipe_run_status`, `txpipe_fetch_example_data` | TXPipe source (read as metadata) + ceci; runs in a separate TXPipe env or on a facility |
 | tjpcov | `tjpcov_list_covariance_types`, `tjpcov_generate_config`, `tjpcov_compute_covariance`, `tjpcov_compare_covariances` | tjpcov 0.5.1: Gaussian f_sky (harmonic and real space), halo-model SSC and cNG terms; NaMaster-coupled types need NaMaster 2.x (facility env) |
@@ -171,10 +174,12 @@ polled with `firecrown_chain_status`, then summarised with
 
 Same recipe as the other HEP-KE servers (a Linux box behind a reverse proxy):
 
-1. Clone, run `scripts/setup_env.sh`, keep the reference clones next to the
-   repo (or point `DESC_*_DIR` at them).
-2. Run under systemd with the HTTP transport bound to localhost and
-   `MCP_PUBLIC=1`, `MCP_OUTPUT_ROOT=/srv/artifacts`,
+1. Clone, run `bash scripts/env.sh` (micromamba + `.mcp-env/` from the lock; no
+   conda on the box), keep the reference clones next to the repo (or point
+   `DESC_*_DIR` at them).
+2. Run `.mcp-env/bin/python -m mcp_server --transport streamable-http` under
+   systemd bound to localhost — `deploy/desc-mcp.service.example` is a
+   complete unit — with `MCP_PUBLIC=1`, `MCP_OUTPUT_ROOT=/srv/artifacts`,
    `MCP_ARTIFACT_URL=https://files.example.org`.
 3. TLS reverse proxy in front: one route to the server port, one static file
    server on `MCP_OUTPUT_ROOT`.
@@ -199,15 +204,14 @@ credentials. Two kernel kinds:
 
 | Kind | Used by | Node needs |
 |---|---|---|
-| pip-kernel | `ccl_*` grids | `pip_deps` from the manifest (`pyccl`, `camb` wheels; installed by the engine) |
-| env-kernel | firecrown loglike/scan/chain, augur forecast, TXPipe pipeline | a facility environment with the DESC stack, named by the user in `env_setup` |
+| lock-kernel (default) | every `inner.*` script: firecrown loglike/scan/chain, augur forecast; `ccl_*` grids | nothing: the pack carries `env/conda-lock.yml` and the engine builds that environment on the node with micromamba (first job per lock: minutes; reused afterwards) |
+| env-kernel (override) | the same scripts when the user passes `env_setup`; TXPipe pipelines always | a facility-resident environment named by the user in `env_setup` |
 
-firecrown and numcosmo are conda-only, which is why env-kernels exist. The
-manifest lists public candidates for `env_setup` — on NERSC the DESC
-`desc-python` stack (`source /global/common/software/lsst/common/miniconda/setup_current_python.sh`)
-or `desc-cosmology`; on ALCF a user-built environment from
-`desc-cosmology-env` — and the user chooses. The `hpc-dispatch-handoff`
-skill walks an agent through it.
+The manifest carries `env_lock` (the path of the lock inside the pack) and
+still lists public `env_setup` candidates for the override — on NERSC the
+DESC `desc-cosmology` stack (`source $CFS/lsst/groups/MCP/setup-cosmology.sh`)
+or `desc-python`; on ALCF a user-built environment from `desc-cosmology-env`.
+The `hpc-dispatch-handoff` skill walks an agent through it.
 
 **Server-side dispatch (server on your own machine).** With
 `pip install -e <hep-genesis-agent>/backend[iri]` in the env and a facility
