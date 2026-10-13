@@ -14,6 +14,7 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pydantic
 import pytest
 
 pytest.importorskip("sacc")
@@ -323,3 +324,130 @@ def test_inner_chain_progress_line(tmp_path):
     stop = _start_progress_writer(str(p), str(out), 20000, period_s=0.1)
     stop()
     assert out.read_text().strip() == "320 accepted samples of 20000, acceptance 0.24, R-1 0.0342"
+
+
+# ---- multi-node chains (contract R9: one Cobaya chain per MPI process) ----
+
+def test_chain_declares_its_mpi_shape_and_the_manifest_mirrors_it():
+    from tools.inner.firecrown_chain import DISPATCH_MPI
+
+    shape = DISPATCH_MPI["main"]
+    assert set(shape) <= {"tasks_per_node", "cpus_per_task", "gpus_per_task", "gather"}
+    assert shape["tasks_per_node"] >= 1 and shape["cpus_per_task"] >= 1
+    mirror = DISPATCH_KERNELS["firecrown_chain"]["mpi"]
+    assert {k: mirror[k] for k in shape} == shape and "nodes" in mirror["note"]
+    engine = pytest.importorskip("hep_genesis.iri.dispatch.mpi")
+    from mcp_server.dispatch import TOOLS_DIR
+    from hep_genesis.iri.dispatch.pack import collect_pack_files, resolve_pack
+
+    pack = resolve_pack(str(TOOLS_DIR))
+    files = {k.removeprefix(f"{pack.remote_name}/"): v for k, v in collect_pack_files(pack).items()}
+    # the engine reads the declaration from the shipped pack text, no import
+    assert engine.kernel_mpi_decl(files, "inner.firecrown_chain.main") == shape
+    assert engine.kernel_mpi_decl(files, "inner.firecrown_loglike.main") is None
+
+
+def test_inner_chain_mpi_helpers(tmp_path):
+    import sys
+
+    from tools.inner.firecrown_chain import _chain_count, _mpi_world
+
+    if "mpi4py.MPI" in sys.modules:
+        pytest.skip("mpi4py already initialised in this process")
+    assert _mpi_world() == (None, 0, 1)  # never imports mpi4py itself
+    assert "mpi4py.MPI" not in sys.modules
+    for name in ("chain.1.txt", "chain.2.txt", "chain.progress", "chain.1.txt.bak", "other.1.txt"):
+        (tmp_path / name).write_text("")
+    assert _chain_count(str(tmp_path), "chain") == 2
+    assert _chain_count(str(tmp_path / "missing"), "chain") == 0
+
+
+def test_inner_chain_refuses_resume_with_a_different_chain_count(experiment, work, monkeypatch):
+    """Cobaya checkpoints one chain per process: a 1-chain run cannot be resumed as 2."""
+    import sys
+    import types
+
+    from tools.inner import firecrown_chain as fc
+
+    class FakeComm:
+        def Get_rank(self): return 0
+        def Get_size(self): return 2
+        def bcast(self, obj, root=0): return obj
+        def Barrier(self): pass
+        def gather(self, obj, root=0): return [obj]
+
+    fake = types.ModuleType("mpi4py.MPI")
+    fake.COMM_WORLD = FakeComm()
+    monkeypatch.setitem(sys.modules, "mpi4py.MPI", fake)
+    assert fc._mpi_world()[1:] == (0, 2)
+    wd = work / "chain_resume_mismatch"
+    wd.mkdir(exist_ok=True)
+    (wd / "chain.1.txt").write_text("")  # one chain from a previous single-process run
+    with pytest.raises(ValueError, match="resume=True with 2 chain"):
+        fc.main({"experiment_yaml": experiment.metadata["experiment_yaml"], "fixed": FIDUCIAL,
+                 "priors": {"sigma8": {"min": 0.6, "max": 1.0}}, "max_samples": 4, "work_dir": str(wd),
+                 "chain_prefix": "chain", "resume": True})
+
+
+def test_run_inner_forwards_nodes_and_reports_the_mpi_shape(experiment, monkeypatch):
+    from mcp_server import dispatch as d
+    from tools.firecrown_tools import _run_inner
+
+    calls = []
+    monkeypatch.setattr(d, "remote_site", lambda: "perlmutter")
+    monkeypatch.setattr(d, "run_kernel", lambda fn, args, **kw: (calls.append(kw) or {
+        "result": {"ok": 1}, "host": "nid001", "mpi": {"size": 8, "nodes": ["nid001", "nid002"]}}))
+    exp = Path(experiment.metadata["experiment_yaml"])
+    res, host = _run_inner("firecrown_chain", {"priors": {}}, None, 600, exp, None, nodes=2)
+    assert res == {"ok": 1} and calls[-1]["nodes"] == 2
+    assert host == "nid001 (8 MPI ranks on 2 nodes)"
+    res, host = _run_inner("firecrown_loglike", {"points": []}, None, 600, exp, None)
+    assert calls[-1]["nodes"] == 1 and host == "nid001 (8 MPI ranks on 2 nodes)"
+    with pytest.raises(ValueError, match="env_setup"):
+        _run_inner("firecrown_chain", {"priors": {}}, "source /x/env.sh", 600, exp, None, nodes=2)
+
+
+def test_run_chain_nodes_validation(experiment, work, monkeypatch):
+    from mcp_server import dispatch as d
+
+    exp = experiment.metadata["experiment_yaml"]
+    common = dict(output_dir=str(work / "chain_nodes"), experiment_yaml=exp, nuisance=FIDUCIAL,
+                  priors={"sigma8": {"min": 0.6, "max": 1.0}}, max_samples=4)
+    with pytest.raises(ValueError, match="set_dispatch"):
+        firecrown_run_chain(nodes=2, **common)  # local: one chain only
+    monkeypatch.setattr(d, "remote_site", lambda: "perlmutter")
+    with pytest.raises(ValueError, match="env_setup"):
+        firecrown_run_chain(nodes=2, env_setup="source /x/env.sh", **common)
+    with pytest.raises(ValueError, match="background"):
+        firecrown_run_chain(nodes=2, background=True, **common)
+    with pytest.raises(pydantic.ValidationError):
+        firecrown_run_chain(nodes=0, **common)
+
+
+def test_run_chain_passes_nodes_to_the_kernel_and_combines_chains(experiment, work, monkeypatch):
+    """Remote 2-node chain: the wrapper sends nodes=2 and shapes the combined result."""
+    from mcp_server import dispatch as d
+
+    seen = {}
+
+    def fake_run_kernel(fn, args, **kw):
+        seen.update(kw, fn=fn, params=args["params"])
+        return {"result": {"chain_files": ["chain.1.txt", "chain.2.txt"], "n_samples": 48, "n_weighted": 60.0,
+                           "n_chains": 8, "chain_samples": [9] * 8, "skip_samples": 0.33,
+                           "acceptance_rate": 0.25, "chain_acceptance": [0.25] * 8,
+                           "summary": {"sigma8": {"mean": 0.8, "std": 0.05, "lower68": 0.75, "upper68": 0.85}},
+                           "sampled": ["sigma8"], "converged": True, "Rminus1": 0.01},
+                "host": "nid001", "mpi": {"size": 8, "nodes": ["nid001", "nid002"]}}
+
+    monkeypatch.setattr(d, "remote_site", lambda: "perlmutter")
+    monkeypatch.setattr(d, "run_kernel", fake_run_kernel)
+    r = firecrown_run_chain(output_dir=str(work / "chain_mpi"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            nuisance=FIDUCIAL, priors={"sigma8": {"min": 0.6, "max": 1.0}}, max_samples=100,
+                            nodes=2, walltime_s=1800, plot=False)
+    assert seen["fn"] == "inner.firecrown_chain.main" and seen["nodes"] == 2 and seen["duration"] == 1800
+    assert seen["params"]["file_locking"] is False and seen["params"]["max_samples"] == 100
+    m = r.metadata
+    assert m["n_chains"] == 8 and m["cobaya_settings"]["nodes"] == 2 and m["cobaya_settings"]["n_chains"] == 8
+    assert m["computed_on"] == "nid001 (8 MPI ranks on 2 nodes)"
+    assert "8 chains combined" in r.message and "cross-chain" in r.message and "smoke test" not in r.message
+    json.dumps(m)

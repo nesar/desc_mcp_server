@@ -130,7 +130,12 @@ report the host they ran on. Heavy tools take an explicit walltime
 runs); the hep-genesis engine routes jobs over the debug cap (Perlmutter
 30 min, Polaris 60 min) to the long queue by itself and rejects durations no
 queue admits before staging. A chain that stops at its walltime is continued
-with `resume=True` and the same arguments. While a heavy call waits for a
+with `resume=True` and the same arguments. `firecrown_run_chain(nodes=N)`
+runs 4 N Cobaya chains in parallel (one MPI process per chain, the kernel's
+`DISPATCH_MPI` shape; the engine builds mpi4py into the lock environment)
+and reports the cross-chain R-1; the charge is N x walltime, the facility's
+node cap (`NERSC_MAX_NODES` / `ALCF_MAX_NODES` in the client's settings)
+applies, and a resume needs the same N. While a heavy call waits for a
 facility job it sends MCP progress heartbeats (every `MCP_HEARTBEAT_S`,
 default 30 s), so clients that reset their request timeout on progress keep
 the call alive; a long LOCAL chain should use `background=True` and be

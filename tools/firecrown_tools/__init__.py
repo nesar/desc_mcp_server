@@ -25,6 +25,7 @@ from pydantic import Field, validate_call
 from ..common import (ArtifactResult, as_float_dict, clone_dir, get_cached,
                       param_slug, resolve_outdir, write_csv, write_json)
 from ..cosmology import CosmologyParams
+from ..inner.firecrown_chain import DISPATCH_MPI as _CHAIN_MPI
 
 __all__ = ["firecrown_list_examples", "firecrown_build_likelihood", "firecrown_compute_loglike",
            "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain",
@@ -110,6 +111,12 @@ DISPATCH_KERNELS = {
     },
     "firecrown_chain": {
         "function": "inner.firecrown_chain.main", "inner": "firecrown_chain",
+        # mirror of tools/inner/firecrown_chain.DISPATCH_MPI (contract R9)
+        "mpi": {**_CHAIN_MPI["main"],
+                "note": "nodes=N launches N x tasks_per_node MPI processes, one Cobaya chain each "
+                        "(same max_samples per chain); R-1 is then the cross-chain statistic and the "
+                        "result combines all chains. Walltime is per chain, charge is nodes x walltime; "
+                        "resume needs the same chain count."},
         "args_shape": "{'params': <the params object below>}; the pack's env/conda-lock.yml supplies "
                       "firecrown - no env_setup, no pip_deps (override: function='envkernel.run_in_env')",
         "params": {"experiment_yaml": "<path>", "fixed": {}, "priors": {"sigma8": {"min": 0.6, "max": 1.0}},
@@ -119,7 +126,8 @@ DISPATCH_KERNELS = {
         "duration_hint_s": 7200,
         "duration_note": "request ~5 s per sample as the job walltime (duration=), at most the facility's "
                          "long-queue cap (Perlmutter regular 12 h); pass the same value minus 60 s as "
-                         "timeout_s; continue a chain that hit its walltime with resume=True",
+                         "timeout_s; continue a chain that hit its walltime with resume=True (and the same "
+                         "nodes)",
         "returns": "Cobaya chain files (job CWD) + weighted means/stds/68% limits per sampled parameter",
     },
 }
@@ -190,8 +198,13 @@ def _remote_params(exp_path: Path, sacc_remote_path: str | None) -> dict:
 
 
 def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: int,
-               exp_path: Path, sacc_remote_path: str | None = None) -> tuple[dict, str]:
-    """Local in-process call or remote env-kernel; returns (result, computed_on)."""
+               exp_path: Path, sacc_remote_path: str | None = None, nodes: int = 1) -> tuple[dict, str]:
+    """Local in-process call or remote env-kernel; returns (result, computed_on).
+
+    ``nodes`` > 1 (facility only) runs the kernel as an MPI job over that many
+    nodes; the kernel must declare DISPATCH_MPI (firecrown_chain does) or the
+    engine refuses before staging.
+    """
     from mcp_server.dispatch import remote_site, run_env_kernel, run_kernel  # lazy: server-only
 
     site = remote_site()
@@ -200,13 +213,24 @@ def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: i
         p.pop("experiment_yaml", None)
         p.update(_remote_params(exp_path, sacc_remote_path))
         if env_setup and env_setup.strip():
+            if nodes > 1:
+                raise ValueError("nodes > 1 runs the kernel as MPI processes inside the pack's own lock "
+                                 "environment (mpi4py is built there); it cannot be combined with env_setup.")
             # override: a facility-resident environment named by the client
             res = run_env_kernel(env_setup, inner_name, p, duration=duration)
             return res["result"]["result"], res.get("host", site)
         # default: the pack's own environment (tools/env/conda-lock.yml), built
         # on the node by the engine; the inner script runs as a plain kernel
-        res = run_kernel(f"inner.{inner_name}.main", {"params": p}, pip_deps=None, duration=duration)
-        return res["result"], res.get("host", site)
+        res = run_kernel(f"inner.{inner_name}.main", {"params": p}, pip_deps=None, duration=duration,
+                         nodes=nodes)
+        host = res.get("host", site)
+        mpi = res.get("mpi") or {}
+        if mpi.get("size"):
+            host = f"{host} ({mpi['size']} MPI ranks on {len(mpi.get('nodes') or []) or nodes} nodes)"
+        return res["result"], host
+    if nodes > 1:
+        raise ValueError("nodes > 1 applies to facility runs: call set_dispatch('perlmutter' or 'polaris') "
+                         "first. Local runs are one chain (use background=True for long ones).")
     import importlib
 
     _load_local(exp_path)  # warm/refresh the in-process cache
@@ -1082,9 +1106,14 @@ def _finish_chain(res: dict, outdir: Path, slug: str, exp_path: Path, plot: bool
         except Exception as exc:  # noqa: BLE001 - plotting is best effort
             warns.append(f"trace plot skipped: {exc}")
     txt = ", ".join(f"{n} = {summary[n]['mean']:.4g} +/- {summary[n]['std']:.3g}" for n in names)
+    n_chains = int(res.get("n_chains") or 1)
+    chains = (f"{n_chains} chains combined (first {res.get('skip_samples', 0):.0%} of each dropped), "
+              f"per-chain samples {res.get('chain_samples')}; R-1 is the cross-chain statistic. "
+              if n_chains > 1 else "")
     return ArtifactResult(
         status="success", files=files,
         message=(f"Cobaya mcmc: {res['n_samples']} accepted samples ({res.get('n_weighted', 0):.0f} weighted), "
+                 f"{chains}"
                  f"acceptance {res.get('acceptance_rate') or float('nan'):.2f}, converged={res.get('converged')} "
                  f"(R-1 = {res.get('Rminus1')}). Posterior means: {txt}."
                  + (f" Computed on {computed_on}." if computed_on != "local" else "")
@@ -1095,6 +1124,8 @@ def _finish_chain(res: dict, outdir: Path, slug: str, exp_path: Path, plot: bool
                   "n_weighted": res.get("n_weighted"), "acceptance_rate": res.get("acceptance_rate"),
                   "converged": res.get("converged"), "Rminus1": res.get("Rminus1"), "best_fit": res.get("best_fit"),
                   "used_getdist": res.get("used_getdist"), "chain_files": res.get("chain_files", []),
+                  "n_chains": n_chains, "chain_samples": res.get("chain_samples"),
+                  "chain_acceptance": res.get("chain_acceptance"),
                   "chain_txt": chain_txt, "warnings": warns, "computed_on": computed_on,
                   "experiment_yaml": str(exp_path), "cobaya_settings": settings},
     )
@@ -1116,6 +1147,7 @@ def firecrown_run_chain(
     sacc_remote_path: str | None = None,
     walltime_s: Annotated[int | None, Field(ge=300, le=86400, description="Walltime of the facility job / timeout of a local run, seconds. Default: ~5 s per sample, clamped to [30 min, 12 h] (the Perlmutter regular-QOS cap; jobs over 30 min route to that QOS). Size max_samples to it, or continue a stopped chain with resume=True.")] = None,
     resume: Annotated[bool, Field(description="Continue a chain with the same prefix/arguments from its Cobaya checkpoint (a run that hit its walltime or max_samples) instead of starting over.")] = False,
+    nodes: Annotated[int, Field(ge=1, description="Facility runs only: nodes for the chain job. Each node runs 4 Cobaya chains in parallel (one MPI process per chain, 8 cores each: the kernel's DISPATCH_MPI shape), so nodes=2 is 8 chains and R-1 becomes the real cross-chain Gelman-Rubin statistic; the result combines all chains. Walltime is per chain (each still runs up to max_samples), the allocation charge is nodes x walltime, and the facility's node cap (NERSC_MAX_NODES / ALCF_MAX_NODES) applies. resume needs the same nodes. Not combinable with env_setup.")] = 1,
     background: Annotated[bool, Field(description="LOCAL runs only: start the chain as a detached subprocess and return at once with the chain paths; poll firecrown_chain_status, then firecrown_plot_chain for the posterior. Use for anything beyond a few hundred samples - a foreground local chain blocks this call for its whole runtime.")] = False,
     dark_energy_model: Annotated[Literal["auto", "fluid", "ppf"], Field(description="CAMB dark-energy model. 'auto' (default) switches to 'ppf' when wa is sampled or non-zero, or the w0 prior straddles -1 - CAMB's fluid model cannot cross w = -1 and the chain would die with 'set the dark_energy_model to ppf'.")] = "auto",
 ) -> ArtifactResult:
@@ -1135,7 +1167,8 @@ def firecrown_run_chain(
     a trace PNG; firecrown_plot_chain draws the corner plot. metadata.converged
     / Rminus1 say whether the run reached rminus1_stop (short runs will not:
     treat them as smoke tests). Run firecrown_scan_loglike first to choose
-    sensible prior ranges.
+    sensible prior ranges. On a facility, nodes=N runs 4 N chains in parallel
+    (one per MPI process) and reports the cross-chain R-1.
     """
     exp_path = _exp_path(experiment_yaml)
     outdir = resolve_outdir(output_dir)
@@ -1172,6 +1205,16 @@ def firecrown_run_chain(
     from mcp_server.dispatch import remote_site
 
     site = remote_site()
+    n_chains = nodes * int(_CHAIN_MPI["main"]["tasks_per_node"]) if site else 1
+    if nodes > 1:
+        if not site:
+            raise ValueError("nodes > 1 applies to facility runs: call set_dispatch('perlmutter' or 'polaris') "
+                             "first. Local runs are one chain (use background=True for long ones).")
+        if env_setup and env_setup.strip():
+            raise ValueError("nodes > 1 runs the chains in the pack's own lock environment (mpi4py is built "
+                             "there); drop env_setup.")
+        if background:
+            raise ValueError("background=True is for local runs; a facility job is already asynchronous.")
     # slug excludes walltime/resume/background so a resumed chain finds its files
     slug = param_slug({"priors": repr(sorted(priors.items())), "fixed": repr(sorted(fixed.items())),
                        "n": max_samples, "seed": seed, "exp": str(exp_path)})
@@ -1184,7 +1227,8 @@ def firecrown_run_chain(
               "file_locking": not site}
     settings = {"sampler": "mcmc", "max_samples": max_samples, "rminus1_stop": rminus1_stop, "seed": seed,
                 "creation_mode": "pure_ccl_mode", "dark_energy_model": dark_energy_model,
-                "walltime_s": walltime, "estimated_seconds": est_s, "resume": resume}
+                "walltime_s": walltime, "estimated_seconds": est_s, "resume": resume,
+                "nodes": nodes, "n_chains": n_chains}
     if resume and not site and not (outdir / f"{prefix}.1.txt").is_file():
         raise ValueError(f"resume=True but no chain {prefix}.1.txt in {outdir}: start without resume, or pass "
                          "the same arguments as the run to continue.")
@@ -1210,7 +1254,8 @@ def firecrown_run_chain(
                       "warnings": warns, "computed_on": "local (background)"},
         )
 
-    res, computed_on = _run_inner("firecrown_chain", params, env_setup, walltime, exp_path, sacc_remote_path)
+    res, computed_on = _run_inner("firecrown_chain", params, env_setup, walltime, exp_path, sacc_remote_path,
+                                  nodes=nodes)
     return _finish_chain(res, outdir, slug, exp_path, plot, fixed, warns, computed_on, settings)
 
 

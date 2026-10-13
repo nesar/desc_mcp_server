@@ -76,8 +76,11 @@ fiducial, `one_sigma_lower/upper` both found (else widen the grid), and
 ~0.01-0.03 conditional). A flat profile means the parameter is unconstrained
 (fix it or add a prior); a minimum at the grid edge means your prior range
 or fiducial is off. Only then run `firecrown_run_chain` - locally with
-`max_samples` ~100-300 as a smoke test, on a facility (set_dispatch +
-env_setup) for a converged posterior.
+`max_samples` ~100-300 as a smoke test, on a facility (set_dispatch; no
+env_setup needed, the pack's own environment is built on the node) for a
+converged posterior. For a real convergence statement use `nodes=2` or more:
+each node runs 4 chains in parallel and R-1 is then measured across chains
+(the single-chain R-1 is only a within-chain segment estimate).
 
 ## Report
 

@@ -146,7 +146,9 @@ def export_dispatch_pack() -> dict:
                 "no env_setup: the pack's env/conda-lock.yml is built on the node. Inner scripts "
                 "run directly as function='inner.<name>.main' with args={params: {...}}. Only to use a "
                 "facility-resident environment instead: function='envkernel.run_in_env' with "
-                "args={env_setup, inner, params, timeout_s}, env_lock='none'."
+                "args={env_setup, inner, params, timeout_s}, env_lock='none'. Multi-node: a kernel whose "
+                "manifest entry has 'mpi' (inner.firecrown_chain.main) takes nodes=N and runs N x "
+                "tasks_per_node MPI processes; other kernels are single-process and refuse nodes > 1."
             ),
         }
     }
@@ -176,8 +178,16 @@ def remote_site() -> str | None:
 
 
 def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
-               duration: int = 600, nodes: int = 1, env_lock: str | bool | None = None) -> dict:
+               duration: int = 600, nodes: int = 1, env_lock: str | bool | None = None,
+               tasks_per_node: int | None = None, cpus_per_task: int | None = None,
+               gpus_per_task: int | None = None) -> dict:
     """Run a kernel from this server's tools/ package on the active site.
+
+    ``nodes`` > 1 is an MPI job (contract R9): the kernel's module must
+    declare ``DISPATCH_MPI`` or the engine refuses before staging;
+    ``tasks_per_node`` / ``cpus_per_task`` / ``gpus_per_task`` override that
+    declaration. The engine dict then carries an ``mpi`` block (size, nodes)
+    and ``result`` is rank 0's return.
 
     Not an MCP tool. ``function`` is a dotted path within tools/ (e.g.
     "ccl.kernels.compute_matter_pk" or "envkernel.run_in_env"); ``args`` must
@@ -201,8 +211,10 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
     try:
         # codes=tools/ ships env/conda-lock.yml with the kernels; the engine
         # builds that environment on the node (env_lock auto-detected).
+        shape = {k: v for k, v in (("tasks_per_node", tasks_per_node), ("cpus_per_task", cpus_per_task),
+                                   ("gpus_per_task", gpus_per_task)) if v}
         result = run(function=function, args=args, codes=str(TOOLS_DIR),
-                     pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock)
+                     pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock, **shape)
     except Exception as exc:
         body = ""
         resp = getattr(exc, "response", None)

@@ -22,12 +22,27 @@ params (JSON):
                           raises OSError errno 524 - the wrapper does so for
                           every facility run.
 
-returns: {"chain_files": [...], "n_samples", "acceptance_rate", "summary":
-          {name: {"mean", "std", "lower68", "upper68"}}, "sampled": [...],
-          "converged": bool|None, "Rminus1": float|None}
+returns: {"chain_files": [...], "n_samples", "n_chains", "acceptance_rate",
+          "summary": {name: {"mean", "std", "lower68", "upper68"}},
+          "sampled": [...], "converged": bool|None, "Rminus1": float|None}
+
+Multi-node (contract R9, hep-genesis make-tools-dispatchable): dispatched
+with nodes > 1 the engine launches nodes x DISPATCH_MPI tasks_per_node
+copies of main(); each MPI process runs ONE Cobaya chain of max_samples,
+R-1 is the real cross-chain Gelman-Rubin statistic, and rank 0 returns the
+summary of all chains combined (first third of each chain skipped). Ranks
+other than 0 return {"rank", "n_samples", "acceptance_rate"}. A resume must
+use the same chain count (Cobaya checkpoints one chain per process).
 """
 
 import os
+
+# One MPI process per Cobaya chain, 8 cores each (CCL/CAMB are partly
+# OpenMP-threaded; a DES-Y1 3x2pt likelihood is memory-light). Conservative
+# on purpose: 4 chains fill a Polaris node (32 cores) and a quarter of a
+# Perlmutter CPU node; run_pack_kernel's tasks_per_node/cpus_per_task
+# override it. The wrapper mirrors this into DISPATCH_KERNELS.
+DISPATCH_MPI = {"main": {"tasks_per_node": 4, "cpus_per_task": 8}}
 
 from .firecrown_loglike import load_experiment, materialize_experiment, required_defaults
 
@@ -91,6 +106,31 @@ def _start_progress_writer(progress_path: str, out_path: str, max_samples: int, 
     return stop
 
 
+def _mpi_world():
+    """(comm, rank, size) when this process runs under the engine's MPI
+    runner, which initialises mpi4py before importing the kernel; (None, 0, 1)
+    otherwise. Never imports mpi4py itself: a bare import outside an MPI
+    launch hangs on some facilities (Perlmutter IRI job steps, 2026-10-12)."""
+    import sys
+
+    mod = sys.modules.get("mpi4py.MPI")
+    if mod is None:
+        return None, 0, 1
+    comm = mod.COMM_WORLD
+    return comm, int(comm.Get_rank()), int(comm.Get_size())
+
+
+def _chain_count(work_dir: str, prefix: str) -> int:
+    """Chains <prefix>.<k>.txt a previous run of this prefix left in work_dir."""
+    import re
+
+    pat = re.compile(re.escape(prefix) + r"\.(\d+)\.txt$")
+    try:
+        return sum(1 for f in os.listdir(work_dir) if pat.match(f))
+    except OSError:
+        return 0
+
+
 def _weighted_summary(names, values, weights) -> dict:
     import numpy as np
 
@@ -114,7 +154,7 @@ def main(params: dict) -> dict:
 
     import numpy as np
 
-    experiment_yaml = os.path.abspath(materialize_experiment(params))
+    experiment_yaml = ""
     fixed = dict(params.get("fixed") or {})
     priors = dict(params.get("priors") or {})
     max_samples = int(params.get("max_samples", 200))
@@ -127,10 +167,19 @@ def main(params: dict) -> dict:
         # must be set before cobaya.output is imported (read at lock time)
         os.environ["COBAYA_USE_FILE_LOCKING"] = "False"
     os.makedirs(work_dir, exist_ok=True)
+    comm, rank, size = _mpi_world()
+    use_mpi = size > 1
 
-    # cheap check that the experiment loads and learn the required names
-    like, tools, _ = load_experiment(experiment_yaml)
-    defaults = required_defaults(like, tools)
+    # Rank 0 materialises the experiment (inline sacc/yaml are written into
+    # the job CWD: one writer) and learns the required names; the others
+    # receive both. Cobaya then builds its own likelihood on every rank.
+    defaults: dict = {}
+    if rank == 0:
+        experiment_yaml = os.path.abspath(materialize_experiment(params))
+        like, tools, _ = load_experiment(experiment_yaml)
+        defaults = required_defaults(like, tools)
+    if comm is not None:
+        experiment_yaml, defaults = comm.bcast((experiment_yaml, defaults) if rank == 0 else None, root=0)
     unknown = sorted(k for k in list(fixed) + list(priors) if k not in defaults)
     if unknown:
         raise ValueError(f"parameters not used by this likelihood: {unknown}; "
@@ -139,9 +188,20 @@ def main(params: dict) -> dict:
         raise ValueError("priors is empty: give at least one sampled parameter "
                          "as {name: {min, max}}.")
 
+    if resume:
+        have = _chain_count(work_dir, prefix)
+        if have and have != size:
+            raise ValueError(
+                f"resume=True with {size} chain(s), but the previous run of {prefix} left {have} chain "
+                f"file(s) in {work_dir}: Cobaya resumes one chain per MPI process. Use the same nodes x "
+                f"chains per node ({have} chains) or start over without resume.")
+
     factory_path = os.path.join(work_dir, f"{prefix}_factory.py")
-    with open(factory_path, "w", encoding="utf-8") as fh:
-        fh.write(_FACTORY_SRC)
+    if rank == 0:
+        with open(factory_path, "w", encoding="utf-8") as fh:
+            fh.write(_FACTORY_SRC)
+    if comm is not None:
+        comm.Barrier()
 
     cobaya_params: dict = {}
     for name, default in defaults.items():
@@ -181,16 +241,33 @@ def main(params: dict) -> dict:
     # relays progress.txt from the job directory as its heartbeat; locally
     # firecrown_chain_status reads the same file). Cobaya knowledge stays
     # HERE, in the kernel, never in the client.
-    stop = _start_progress_writer(os.path.join(work_dir, f"{prefix}.progress"),
-                                  os.path.join(os.getcwd(), "progress.txt"), max_samples)
+    # Cobaya writes <prefix>.progress from its main process only.
+    stop = (_start_progress_writer(os.path.join(work_dir, f"{prefix}.progress"),
+                                   os.path.join(os.getcwd(), "progress.txt"), max_samples)
+            if rank == 0 else (lambda: None))
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _updated, sampler = run(info, no_mpi=True)
+            # no_mpi=True outside an MPI launch: Cobaya would otherwise import
+            # mpi4py on its own (see _mpi_world).
+            _updated, sampler = run(info, no_mpi=not use_mpi)
     finally:
         stop()
 
-    sample = sampler.products()["sample"]
+    own_n = int(len(sampler.collection))
+    try:
+        own_acc = float(sampler.get_acceptance_rate())
+    except Exception:  # noqa: BLE001
+        own_acc = None
+    # combined=True concatenates every rank's chain (a collective call: all
+    # ranks make it); the first third of each chain is dropped as burn-in
+    # before concatenation, the Cobaya recommendation for combined chains.
+    skip = 0.33 if use_mpi else 0
+    sample = sampler.products(combined=use_mpi, skip_samples=skip)["sample"]
+    chain_samples = comm.gather(own_n, root=0) if comm is not None else [own_n]
+    chain_acc = comm.gather(own_acc, root=0) if comm is not None else [own_acc]
+    if rank != 0:
+        return {"rank": rank, "n_samples": own_n, "acceptance_rate": own_acc}
     sampled = list(priors)
     # all weighted samples (cobaya already removed burn_in=0)
     data = sample.data if hasattr(sample, "data") else sample
@@ -210,10 +287,8 @@ def main(params: dict) -> dict:
         used_getdist = False
 
     n_samples = int(len(weights))
-    try:
-        acc = float(sampler.get_acceptance_rate())
-    except Exception:  # noqa: BLE001
-        acc = None
+    accs = [a for a in chain_acc if a is not None]
+    acc = float(sum(accs) / len(accs)) if accs else None
     rminus1 = None
     converged = None
     try:
@@ -236,7 +311,8 @@ def main(params: dict) -> dict:
                 for n in sampled}
         best["minuslogpost"] = float(np.asarray(data["minuslogpost"])[i])
     return {"chain_files": chain_files, "n_samples": n_samples, "n_weighted": float(weights.sum()),
-            "acceptance_rate": acc, "summary": summary, "sampled": sampled,
+            "n_chains": size, "chain_samples": [int(n) for n in chain_samples], "skip_samples": skip,
+            "acceptance_rate": acc, "chain_acceptance": chain_acc, "summary": summary, "sampled": sampled,
             "fixed": {k: v for k, v in cobaya_params.items() if not isinstance(v, dict)},
             "converged": converged, "Rminus1": rminus1, "used_getdist": used_getdist,
             "best_fit": best, "loglike_column": loglike_col, "factory_file": factory_path}
