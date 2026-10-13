@@ -310,3 +310,16 @@ def test_remote_routing_lock_kernel_vs_env_setup(experiment, monkeypatch):
     assert calls[-1][2]["pip_deps"] is None and calls[-1][2]["duration"] == 600
     res, host = _run_inner("firecrown_loglike", {"points": []}, "source /x/env.sh", 600, exp, None)
     assert res == {"ok": 2} and host == "nid002" and calls[-1][:2] == ("env", "firecrown_loglike")
+
+
+def test_inner_chain_progress_line(tmp_path):
+    from tools.inner.firecrown_chain import _progress_line, _start_progress_writer
+
+    p = tmp_path / "c.progress"
+    assert _progress_line(str(p), 20) is None
+    p.write_text("#  N  timestamp  acceptance_rate  Rminus1  Rminus1_cl\n 320.0 2026-10-11T08:40:45 0.243 0.0342 NaN\n")
+    assert _progress_line(str(p), 20000) == "320 accepted samples of 20000, acceptance 0.24, R-1 0.0342"
+    out = tmp_path / "progress.txt"
+    stop = _start_progress_writer(str(p), str(out), 20000, period_s=0.1)
+    stop()
+    assert out.read_text().strip() == "320 accepted samples of 20000, acceptance 0.24, R-1 0.0342"

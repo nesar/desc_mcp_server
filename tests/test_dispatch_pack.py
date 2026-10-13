@@ -99,3 +99,16 @@ def test_manifest_documents_walltime_and_timeout():
     assert "timeout_s" in env["args"] and "walltime" in env
     assert "timeout_s" in pack["usage"] and "duration" in pack["usage"]
     assert "duration_note" in pack["kernels"]["firecrown_chain"]
+
+
+def test_env_kernel_opts_out_of_the_lock_env(monkeypatch):
+    """env_setup names the environment: the engine must not build/activate the lock env."""
+    from mcp_server import dispatch as d
+
+    calls = []
+    monkeypatch.setitem(d._state, "site", "perlmutter")
+    monkeypatch.setattr(d, "_engine", lambda: {"perlmutter": lambda **kw: (calls.append(kw) or {"status": "success", "result": {"ok": 1}})})
+    d.run_env_kernel("source /x.sh", "noop", {"a": 1}, duration=600)
+    assert calls[-1]["env_lock"] is False and calls[-1]["function"] == "envkernel.run_in_env"
+    d.run_kernel("inner.noop.main", {"params": {}}, duration=600)
+    assert calls[-1]["env_lock"] is None  # lock env by default

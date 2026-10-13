@@ -1264,9 +1264,17 @@ def firecrown_chain_status(
     elif chain.is_file():
         status = "running" if locked else "finished"
     last = progress.get("last") or {}
+    note = ""
+    ptxt = work / "progress.txt"
+    if ptxt.is_file():
+        try:
+            note = ptxt.read_text(encoding="utf-8").strip().splitlines()[-1]
+        except (OSError, IndexError):
+            note = ""
     return ArtifactResult(
         status="success", files=[],
         message=(f"Chain {stem}: {status}; {n_lines} accepted samples in the chain file"
+                 + (f" [{note}]" if note else "")
                  + (f"; last checkpoint N={last['N']}, acceptance {last['acceptance_rate']:.2f}, "
                     f"R-1 = {last['Rminus1']:.3g}" if last else "; no checkpoint yet")
                  + (f". Error: {error[:200]}" if error else "")

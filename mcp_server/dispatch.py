@@ -176,7 +176,7 @@ def remote_site() -> str | None:
 
 
 def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
-               duration: int = 600, nodes: int = 1) -> dict:
+               duration: int = 600, nodes: int = 1, env_lock: str | bool | None = None) -> dict:
     """Run a kernel from this server's tools/ package on the active site.
 
     Not an MCP tool. ``function`` is a dotted path within tools/ (e.g.
@@ -184,6 +184,12 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
     be JSON-safe. Returns the engine dict: result, host, and artifact_files
     (local paths of files the kernel wrote in its job directory, fetched
     back automatically where the staging path supports it).
+
+    ``env_lock``: None = the pack's own environment (tools/env/conda-lock.yml,
+    built on the node); False = do NOT build/activate it (env-kernels that
+    activate a facility environment of their own - otherwise the lock env's
+    python stays first on PATH and the override never takes effect, seen on
+    Perlmutter 2026-10-10).
 
     Raises RuntimeError with remediation text on any dispatch failure -
     callers should surface it, and agents must NOT blind-retry.
@@ -196,7 +202,7 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
         # codes=tools/ ships env/conda-lock.yml with the kernels; the engine
         # builds that environment on the node (env_lock auto-detected).
         result = run(function=function, args=args, codes=str(TOOLS_DIR),
-                     pip_deps=pip_deps, duration=duration, nodes=nodes)
+                     pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock)
     except Exception as exc:
         body = ""
         resp = getattr(exc, "response", None)
@@ -240,10 +246,12 @@ def run_env_kernel(env_setup: str, inner: str, params: dict, duration: int = 180
     Not an MCP tool. Convenience over run_kernel for env-kernels; returns the
     engine dict whose ["result"] is {"result": <inner result>, "env_check": ...}.
     """
+    # env_lock=False: the client's env_setup names the environment; the
+    # pack's lock env must not be built or put on PATH for this job.
     return run_kernel("envkernel.run_in_env",
                       {"env_setup": env_setup, "inner": inner, "params": params,
                        "timeout_s": max(60, duration - 60)},
-                      pip_deps=None, duration=duration, nodes=nodes)
+                      pip_deps=None, duration=duration, nodes=nodes, env_lock=False)
 
 
 def set_dispatch(site: str, artifact_dir: str | None = None) -> str:

@@ -79,8 +79,19 @@ async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: flo
                 return task.result()
             if ctx is not None:
                 elapsed = int(time.monotonic() - started)
+                text = f"{label}: {elapsed // 60} min elapsed (still running)"
                 try:
-                    await ctx.report_progress(elapsed, None, f"{label}: {elapsed // 60} min elapsed (still running)")
+                    # server-side dispatch: the engine knows the facility job's
+                    # state, elapsed time and stdout digest - say that instead
+                    from hep_genesis.iri.dispatch.progress import message as _job_message
+
+                    live = _job_message()
+                    if live:
+                        text = f"{label}: {live}"
+                except Exception:  # noqa: BLE001 - engine absent or old
+                    pass
+                try:
+                    await ctx.report_progress(elapsed, None, text)
                 except Exception:  # noqa: BLE001 - progress is advisory
                     pass
     finally:

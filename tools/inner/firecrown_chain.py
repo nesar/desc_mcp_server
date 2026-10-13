@@ -42,6 +42,55 @@ def build_likelihood(build_parameters):
 '''
 
 
+def _progress_line(progress_path: str, max_samples: int) -> str | None:
+    """'N accepted samples of M, acceptance 0.25, R-1 0.048' from Cobaya's
+    <prefix>.progress table (None until the first checkpoint)."""
+    try:
+        with open(progress_path, encoding="utf-8") as fh:
+            rows = [ln.split() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+    except OSError:
+        return None
+    if not rows:
+        return None
+    last = rows[-1]
+    try:
+        n, acc, r = int(float(last[0])), float(last[2]), float(last[3])
+    except (IndexError, ValueError):
+        return None
+    return f"{n} accepted samples of {max_samples}, acceptance {acc:.2f}, R-1 {r:.3g}"
+
+
+def _start_progress_writer(progress_path: str, out_path: str, max_samples: int, period_s: float = 60.0):
+    """Background thread: every period, rewrite out_path with the latest
+    one-liner. Returns a stop() that writes the final line."""
+    import threading
+
+    halt = threading.Event()
+
+    def write_once() -> None:
+        line = _progress_line(progress_path, max_samples) or f"sampling (max {max_samples} samples)"
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+    def loop() -> None:
+        write_once()
+        while not halt.wait(period_s):
+            write_once()
+
+    t = threading.Thread(target=loop, name="chain-progress", daemon=True)
+    t.start()
+
+    def stop() -> None:
+        halt.set()
+        t.join(timeout=5)
+        write_once()
+
+    return stop
+
+
 def _weighted_summary(names, values, weights) -> dict:
     import numpy as np
 
@@ -128,9 +177,18 @@ def main(params: dict) -> dict:
 
     from cobaya.run import run
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _updated, sampler = run(info, no_mpi=True)
+    # Human one-liner for whoever is waiting on this job (the dispatch engine
+    # relays progress.txt from the job directory as its heartbeat; locally
+    # firecrown_chain_status reads the same file). Cobaya knowledge stays
+    # HERE, in the kernel, never in the client.
+    stop = _start_progress_writer(os.path.join(work_dir, f"{prefix}.progress"),
+                                  os.path.join(os.getcwd(), "progress.txt"), max_samples)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _updated, sampler = run(info, no_mpi=True)
+    finally:
+        stop()
 
     sample = sampler.products()["sample"]
     sampled = list(priors)
