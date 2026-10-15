@@ -137,3 +137,35 @@ def test_job_lands_in_the_calls_output_dir(monkeypatch, tmp_path):
     assert env["job_name"].startswith("noop_")
     d.run_kernel("inner.noop.main", {"params": {}}, duration=600)  # no call context: engine defaults
     assert "artifact_dir" not in calls[-1] and "job_name" not in calls[-1]
+
+
+def test_run_kernel_no_wait_returns_the_handle_and_collect_kernel_checks(monkeypatch, tmp_path):
+    """wait=False (contract R10): the engine's 'submitted' handle passes through
+    untouched; collect_kernel reads the record, passes pending through and
+    raises the usual error for a failed job."""
+    import pytest
+
+    pytest.importorskip("hep_genesis")
+    from hep_genesis.iri.dispatch import collect as c
+
+    from mcp_server import dispatch as d
+
+    calls = []
+    handle = {"status": "submitted", "job_id": "42", "site": "perlmutter", "record": str(tmp_path / "r.json")}
+    monkeypatch.setitem(d._state, "site", "perlmutter")
+    monkeypatch.setattr(d, "_engine", lambda: {"perlmutter": lambda **kw: (calls.append(kw) or dict(handle))})
+    assert d.run_kernel("inner.noop.main", {"params": {}}, duration=600, wait=False) == handle
+    assert calls[-1]["wait"] is False
+    d.run_kernel("inner.noop.main", {"params": {}}, duration=600, wait=False)
+    calls.clear()
+    monkeypatch.setattr(d, "_engine", lambda: {"perlmutter": lambda **kw: (calls.append(kw) or {"status": "success", "result": {}})})
+    d.run_kernel("inner.noop.main", {"params": {}}, duration=600)
+    assert "wait" not in calls[-1]  # older engines without the arg keep working
+
+    rec = tmp_path / "dispatch_noop_1.json"
+    rec.write_text(json.dumps({"job_name": "noop_1", "job_id": "42", "site": "perlmutter"}))
+    monkeypatch.setattr(c, "collect_dispatched", lambda r: {"status": "pending", "state": "QUEUED"})
+    assert d.collect_kernel(str(rec))["status"] == "pending"
+    monkeypatch.setattr(c, "collect_dispatched", lambda r: {"status": "error", "error": "boom", "stderr": "x"})
+    with pytest.raises(RuntimeError, match="boom"):
+        d.collect_kernel(str(rec))

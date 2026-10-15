@@ -451,3 +451,51 @@ def test_run_chain_passes_nodes_to_the_kernel_and_combines_chains(experiment, wo
     assert m["computed_on"] == "nid001 (8 MPI ranks on 2 nodes)"
     assert "8 chains combined" in r.message and "cross-chain" in r.message and "smoke test" not in r.message
     json.dumps(m)
+
+
+def test_run_chain_no_wait_then_collect(experiment, work, monkeypatch, tmp_path):
+    """wait=False submits and returns a pending file at once (contract R10);
+    firecrown_collect_chain reports 'pending' until the job is done, then
+    shapes the chain like a waiting run - with the facility's chain file paths
+    mapped to the local copies the engine fetched back (trace plot works)."""
+    from mcp_server import dispatch as d
+    from tools.firecrown_tools import firecrown_collect_chain
+
+    seen = {}
+
+    def fake_run_kernel(fn, args, **kw):
+        seen.update(kw)
+        return {"status": "submitted", "job_id": "59800001", "site": "perlmutter", "node_hours": 2.0,
+                "record": str(tmp_path / "dispatch_x.json"), "artifact_dir": str(tmp_path)}
+
+    monkeypatch.setattr(d, "remote_site", lambda: "perlmutter")
+    monkeypatch.setattr(d, "run_kernel", fake_run_kernel)
+    out = work / "chain_nowait"
+    r = firecrown_run_chain(output_dir=str(out), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            nuisance=FIDUCIAL, priors={"sigma8": {"min": 0.6, "max": 1.0}}, max_samples=100,
+                            walltime_s=1800, wait=False)
+    assert seen["wait"] is False and r.metadata["submitted"] and "59800001" in r.message
+    pending = r.metadata["pending"]
+    assert Path(pending).is_file() and "firecrown_collect_chain" in r.message
+
+    monkeypatch.setattr(d, "collect_kernel", lambda rec: {"status": "pending", "state": "QUEUED", "message": "later"})
+    p = firecrown_collect_chain(output_dir=str(out), pending=pending)
+    assert p.metadata["pending"] and "QUEUED" in p.message
+
+    chain = tmp_path / "fetched" / "chain_abc.1.txt"
+    chain.parent.mkdir()
+    chain.write_text("# weight minuslogpost sigma8\n" + "\n".join(f"1 {i} {0.8 + 0.001 * i}" for i in range(20)))
+    done = {"status": "success", "host": "nid001", "artifact_files": [str(chain)],
+            "result": {"chain_files": ["./chain_abc.1.txt"], "n_samples": 20, "n_weighted": 20.0,
+                       "acceptance_rate": 0.3, "converged": True, "Rminus1": 0.01, "sampled": ["sigma8"],
+                       "summary": {"sigma8": {"mean": 0.81, "std": 0.01, "lower68": 0.80, "upper68": 0.82}}}}
+    monkeypatch.setattr(d, "collect_kernel", lambda rec: done)
+    f = firecrown_collect_chain(output_dir=str(out), pending=pending)
+    assert f.metadata["chain_txt"] == str(chain) and f.metadata["converged"] is True
+    assert any(x.endswith(".png") for x in f.files)  # trace plot drawn from the local copy
+
+
+def test_run_chain_no_wait_is_facility_only(experiment, work):
+    with pytest.raises(ValueError, match="facility"):
+        firecrown_run_chain(output_dir=str(work / "nw_local"), experiment_yaml=experiment.metadata["experiment_yaml"],
+                            nuisance=FIDUCIAL, priors={"sigma8": {"min": 0.6, "max": 1.0}}, wait=False)

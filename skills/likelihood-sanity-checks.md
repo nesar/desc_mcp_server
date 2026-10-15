@@ -82,6 +82,15 @@ converged posterior. For a real convergence statement use `nodes=2` or more:
 each node runs 4 chains in parallel and R-1 is then measured across chains
 (the single-chain R-1 is only a within-chain segment estimate).
 
+Facility chains run for hours: pass `wait=False` so the call returns the
+moment the scheduler accepts the job (job id + `metadata.pending`), then
+`firecrown_collect_chain(output_dir, pending=<metadata.pending>)` once the job
+has finished (it reports `pending` with the scheduler state until then -
+never resubmit). Always use `wait=False` when two chains must run at the same
+time (e.g. one on Perlmutter, one on Polaris): `set_dispatch("perlmutter")`,
+submit, `set_dispatch("polaris")`, submit, then collect each. A waiting call
+blocks every other heavy call on this server until its job ends.
+
 ## Report
 
 Quote: n_data, chi2 and chi2/dof at the fiducial, the 3 worst statistics by

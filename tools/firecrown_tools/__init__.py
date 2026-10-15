@@ -29,7 +29,8 @@ from ..inner.firecrown_chain import DISPATCH_MPI as _CHAIN_MPI
 
 __all__ = ["firecrown_list_examples", "firecrown_build_likelihood", "firecrown_compute_loglike",
            "firecrown_theory_data_vector", "firecrown_scan_loglike", "firecrown_run_chain",
-           "firecrown_chain_status", "firecrown_plot_chain", "firecrown_chain_cancel"]
+           "firecrown_chain_status", "firecrown_plot_chain", "firecrown_chain_cancel",
+           "firecrown_collect_chain"]
 
 CONVENTIONS = {
     "parameter_names": "firecrown == pyccl: Omega_c Omega_b h n_s sigma8|A_s Omega_k Neff m_nu[eV] w0 wa T_CMB; "
@@ -197,13 +198,38 @@ def _remote_params(exp_path: Path, sacc_remote_path: str | None) -> dict:
     return out
 
 
+def _localize_files(result: dict, artifact_files: list[str] | None) -> dict:
+    """Map the remote paths a facility kernel reports (chain_files, e.g.
+    './chain.1.txt' in the job dir) to the local copies the engine fetched
+    back (artifact_files, by file name). Without this a facility chain had no
+    local chain_txt, so no trace plot and nothing for firecrown_plot_chain."""
+    if not isinstance(result, dict) or not artifact_files:
+        return result
+    local = {Path(f).name: f for f in artifact_files}
+    if isinstance(result.get("chain_files"), list):
+        result["chain_files"] = [local.get(Path(f).name, f) for f in result["chain_files"]]
+    return result
+
+
+def _remote_result(res: dict, site: str, nodes: int = 1) -> tuple[dict, str]:
+    """(kernel result with local file paths, computed_on) from an engine dict."""
+    host = res.get("host", site)
+    mpi = res.get("mpi") or {}
+    if mpi.get("size"):
+        host = f"{host} ({mpi['size']} MPI ranks on {len(mpi.get('nodes') or []) or nodes} nodes)"
+    return _localize_files(res["result"], res.get("artifact_files")), host
+
+
 def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: int,
-               exp_path: Path, sacc_remote_path: str | None = None, nodes: int = 1) -> tuple[dict, str]:
+               exp_path: Path, sacc_remote_path: str | None = None, nodes: int = 1,
+               wait: bool = True) -> tuple[dict, str]:
     """Local in-process call or remote env-kernel; returns (result, computed_on).
 
     ``nodes`` > 1 (facility only) runs the kernel as an MPI job over that many
     nodes; the kernel must declare DISPATCH_MPI (firecrown_chain does) or the
-    engine refuses before staging.
+    engine refuses before staging. ``wait=False`` (facility, lock env only)
+    returns the engine's submission handle ``{"status": "submitted", ...}``
+    instead of the result.
     """
     from mcp_server.dispatch import remote_site, run_env_kernel, run_kernel  # lazy: server-only
 
@@ -216,18 +242,21 @@ def _run_inner(inner_name: str, params: dict, env_setup: str | None, duration: i
             if nodes > 1:
                 raise ValueError("nodes > 1 runs the kernel as MPI processes inside the pack's own lock "
                                  "environment (mpi4py is built there); it cannot be combined with env_setup.")
+            if not wait:
+                raise ValueError("wait=False runs in the pack's own lock environment; drop env_setup.")
             # override: a facility-resident environment named by the client
             res = run_env_kernel(env_setup, inner_name, p, duration=duration)
-            return res["result"]["result"], res.get("host", site)
+            return _localize_files(res["result"]["result"], res.get("artifact_files")), res.get("host", site)
         # default: the pack's own environment (tools/env/conda-lock.yml), built
         # on the node by the engine; the inner script runs as a plain kernel
         res = run_kernel(f"inner.{inner_name}.main", {"params": p}, pip_deps=None, duration=duration,
-                         nodes=nodes)
-        host = res.get("host", site)
-        mpi = res.get("mpi") or {}
-        if mpi.get("size"):
-            host = f"{host} ({mpi['size']} MPI ranks on {len(mpi.get('nodes') or []) or nodes} nodes)"
-        return res["result"], host
+                         nodes=nodes, wait=wait)
+        if res.get("status") == "submitted":
+            return res, site
+        return _remote_result(res, site, nodes)
+    if not wait:
+        raise ValueError("wait=False applies to facility runs (set_dispatch first); local long runs use "
+                         "background=True.")
     if nodes > 1:
         raise ValueError("nodes > 1 applies to facility runs: call set_dispatch('perlmutter' or 'polaris') "
                          "first. Local runs are one chain (use background=True for long ones).")
@@ -1150,6 +1179,7 @@ def firecrown_run_chain(
     nodes: Annotated[int, Field(ge=1, description="Facility runs only: nodes for the chain job. Each node runs 4 Cobaya chains in parallel (one MPI process per chain, 8 cores each: the kernel's DISPATCH_MPI shape), so nodes=2 is 8 chains and R-1 becomes the real cross-chain Gelman-Rubin statistic; the result combines all chains. Walltime is per chain (each still runs up to max_samples), the allocation charge is nodes x walltime, and the facility's node cap (NERSC_MAX_NODES / ALCF_MAX_NODES) applies. resume needs the same nodes. Not combinable with env_setup.")] = 1,
     background: Annotated[bool, Field(description="LOCAL runs only: start the chain as a detached subprocess and return at once with the chain paths; poll firecrown_chain_status, then firecrown_plot_chain for the posterior. Use for anything beyond a few hundred samples - a foreground local chain blocks this call for its whole runtime.")] = False,
     dark_energy_model: Annotated[Literal["auto", "fluid", "ppf"], Field(description="CAMB dark-energy model. 'auto' (default) switches to 'ppf' when wa is sampled or non-zero, or the w0 prior straddles -1 - CAMB's fluid model cannot cross w = -1 and the chain would die with 'set the dark_energy_model to ppf'.")] = "auto",
+    wait: Annotated[bool, Field(description="Facility runs only. True (default): this call blocks until the job finishes (queue + walltime: possibly hours). False: return as soon as the scheduler accepts the job, with metadata.pending (a chain_pending_<slug>.json file) - then call firecrown_collect_chain(pending=...) later for the summary, trace plot and chain files. Use False for long chains and whenever several jobs must run at the same time (e.g. one chain on Perlmutter and one on Polaris: set_dispatch + submit, set_dispatch + submit, then collect both).")] = True,
 ) -> ArtifactResult:
     """Run a Cobaya MCMC over a firecrown experiment in pure-CCL mode (no theory block) and summarise the posterior.
 
@@ -1254,12 +1284,80 @@ def firecrown_run_chain(
                       "warnings": warns, "computed_on": "local (background)"},
         )
 
+    if not wait and not site:
+        raise ValueError("wait=False applies to facility runs (set_dispatch first); a long local chain uses "
+                         "background=True.")
     res, computed_on = _run_inner("firecrown_chain", params, env_setup, walltime, exp_path, sacc_remote_path,
-                                  nodes=nodes)
+                                  nodes=nodes, wait=wait)
+    if isinstance(res, dict) and res.get("status") == "submitted":
+        pending = outdir / f"chain_pending_{slug}.json"
+        write_json(pending, {"record": res.get("record"), "job_id": res.get("job_id"), "site": res.get("site"),
+                             "slug": slug, "experiment_yaml": str(exp_path), "plot": plot, "fixed": fixed,
+                             "warnings": warns, "settings": settings, "chain_prefix": prefix,
+                             "node_hours": res.get("node_hours")})
+        return ArtifactResult(
+            status="success", files=[str(pending)],
+            message=(f"Chain submitted to {res.get('site')} as job {res.get('job_id')} ({nodes} node(s), "
+                     f"walltime {walltime} s, up to {res.get('node_hours')} node-hours); not waiting for it. "
+                     f"Poll find_dispatched_jobs(directory='{res.get('artifact_dir')}') on the facility server; "
+                     f"when the job has finished, call firecrown_collect_chain(output_dir='{outdir}', "
+                     f"pending='{pending}') for the posterior summary, trace plot and chain files. "
+                     + (res.get("note") or "") + " " + " ".join(warns)).strip(),
+            metadata={"submitted": True, "pending": str(pending), "job_id": res.get("job_id"),
+                      "site": res.get("site"), "record": res.get("record"), "artifact_dir": res.get("artifact_dir"),
+                      "chain_prefix": prefix, "sampled": list(priors), "fixed": fixed,
+                      "experiment_yaml": str(exp_path), "cobaya_settings": settings, "warnings": warns,
+                      "computed_on": res.get("site")},
+        )
     return _finish_chain(res, outdir, slug, exp_path, plot, fixed, warns, computed_on, settings)
 
 
 firecrown_run_chain.weight = "heavy"
+
+
+@validate_call
+def firecrown_collect_chain(
+    output_dir: Annotated[str, Field(min_length=1)],
+    pending: Annotated[str, Field(min_length=1, description="The chain_pending_<slug>.json file firecrown_run_chain(wait=False) returned (metadata.pending).")],
+) -> ArtifactResult:
+    """Collect a facility chain submitted with firecrown_run_chain(wait=False): one non-blocking look at the job.
+
+    Finished: fetches the chain files back and returns the same summary as a
+    waiting firecrown_run_chain (means, 68% intervals, R-1 / converged, trace
+    plot; then firecrown_plot_chain for the corner plot). Still queued or
+    running: status 'pending' with the scheduler state - call again later,
+    never resubmit. Ended without results: an error with the job's stderr
+    verdict. Works whatever set_dispatch currently says: the job's record
+    names its facility.
+    """
+    import json as _json
+
+    from mcp_server.dispatch import collect_kernel  # lazy: server-only
+
+    pfile = Path(pending).expanduser()
+    if not pfile.is_file():
+        raise ValueError(f"No pending-chain file at {pfile}: pass metadata.pending from firecrown_run_chain(wait=False).")
+    info = _json.loads(pfile.read_text(encoding="utf-8"))
+    if not info.get("record"):
+        raise ValueError(f"{pfile} has no dispatch record (the submission wrote none - no artifact folder?).")
+    outdir = resolve_outdir(output_dir)
+    res = collect_kernel(info["record"])
+    if res.get("status") in ("pending", "unknown"):
+        return ArtifactResult(
+            status="success", files=[],
+            message=(f"Chain job {info.get('job_id')} on {info.get('site')}: {res.get('state') or res['status']} - "
+                     f"no results yet. {res.get('message', '')} Call firecrown_collect_chain again later."),
+            metadata={"pending": True, "state": res.get("state"), "job_id": info.get("job_id"),
+                      "site": info.get("site"), "record": info["record"]},
+        )
+    result, computed_on = _remote_result(res, info.get("site") or "facility",
+                                         int(info.get("settings", {}).get("nodes") or 1))
+    return _finish_chain(result, outdir, info["slug"], Path(info["experiment_yaml"]), bool(info.get("plot", True)),
+                         info.get("fixed") or {}, list(info.get("warnings") or []), computed_on,
+                         info.get("settings") or {})
+
+
+firecrown_collect_chain.weight = "dispatchable"
 
 
 @validate_call

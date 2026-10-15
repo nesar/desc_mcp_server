@@ -203,8 +203,13 @@ def remote_site() -> str | None:
 def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
                duration: int = 600, nodes: int = 1, env_lock: str | bool | None = None,
                tasks_per_node: int | None = None, cpus_per_task: int | None = None,
-               gpus_per_task: int | None = None) -> dict:
+               gpus_per_task: int | None = None, wait: bool = True) -> dict:
     """Run a kernel from this server's tools/ package on the active site.
+
+    ``wait=False`` (hep-genesis contract R10) returns as soon as the
+    scheduler accepts the job: the engine's ``{"status": "submitted",
+    "job_id", "record", ...}`` handle. :func:`collect_kernel` fetches the
+    result later from that record.
 
     ``nodes`` > 1 is an MPI job (contract R9): the kernel's module must
     declare ``DISPATCH_MPI`` or the engine refuses before staging;
@@ -238,7 +243,7 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
                                    ("gpus_per_task", gpus_per_task)) if v}
         result = run(function=function, args=args, codes=str(TOOLS_DIR),
                      pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock,
-                     **_job_placement(function, args), **shape)
+                     **_job_placement(function, args), **shape, **({} if wait else {"wait": False}))
     except Exception as exc:
         body = ""
         resp = getattr(exc, "response", None)
@@ -262,6 +267,13 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
             f"Remote dispatch to {site} failed: {exc}\n"
             f"{('Response body: ' + body) if body else ''}{hint}\n{advice}"
         ) from exc
+    if not wait and result.get("status") == "submitted":
+        return result
+    return _check_result(result, site)
+
+
+def _check_result(result: dict, site: str) -> dict:
+    """Raise the agent-facing error for a failed engine/kernel result."""
     if result.get("status") != "success":
         raise RuntimeError(
             f"Remote job on {site} failed: {result.get('error', 'unknown error')}\n"
@@ -273,6 +285,27 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
         raise RuntimeError(f"Kernel on {site} reported: {inner}\nDo NOT retry blindly - "
                            "fix the inputs or the env_setup and call again.")
     return result
+
+
+def collect_kernel(record: str) -> dict:
+    """One non-blocking look at a job submitted with ``run_kernel(wait=False)``
+    (or one whose waiting call timed out), from its ``dispatch_<job>.json``
+    record path. Returns the engine dict like :func:`run_kernel` once the job
+    has finished, or ``{"status": "pending" | "unknown", "state", "message"}``
+    while it has not; raises RuntimeError when it ended without results.
+
+    Not an MCP tool. Works whatever the active site is: the record names it.
+    """
+    try:
+        from hep_genesis.iri.dispatch.collect import collect_dispatched, load_record
+    except ImportError as exc:
+        raise RuntimeError("Collecting a no-wait job needs a hep-genesis backend with "
+                           "hep_genesis.iri.dispatch.collect (update the engine install).") from exc
+    rec = load_record(record)
+    result = collect_dispatched(rec)
+    if isinstance(result, dict) and result.get("status") in ("pending", "unknown"):
+        return result
+    return _check_result(result, rec["site"])
 
 
 def run_env_kernel(env_setup: str, inner: str, params: dict, duration: int = 1800,

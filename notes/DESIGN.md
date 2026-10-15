@@ -103,6 +103,7 @@ formula — for sacc files that lack a covariance, e.g. TXPipe `twopoint_data_*.
 | `firecrown_chain_status` | L | poll a running/finished chain: samples so far, acceptance, R-1 from `.progress`, background process state |
 | `firecrown_plot_chain` | L | posterior summary after burn-in + getdist corner plot + trace from any Cobaya chain file |
 | `firecrown_chain_cancel` | L | stop a background chain (the chat Stop button cannot reach a server subprocess) |
+| `firecrown_collect_chain` | M | collect a facility chain submitted with `firecrown_run_chain(wait=False)`: pending until the job ends, then the same summary/trace as a waiting run |
 
 ### augur_tools (6) — augur 1.2.4, env-kernel dispatch
 `list_augur_examples`, `generate_forecast_config` (Y1/Y10, probes, bins, ndens, sigma_e, ell binning,

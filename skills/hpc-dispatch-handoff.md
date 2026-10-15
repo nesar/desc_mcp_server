@@ -42,6 +42,12 @@ exist: the engine's venv + pip bootstrap cannot build them on a node.
    - pip-kernel: `function` and `pip_deps` (`base_pip_deps` + the kernel's `pip_deps`) from the manifest.
    - env-kernel: `function="envkernel.run_in_env"`, `args={"env_setup": ..., "inner": <manifest inner>, "params": <the kernel's params>}`, `pip_deps=[]`.
    - `duration` >= the manifest's `duration_hint_s`; `artifact_dir` = the client run directory.
+   - Long jobs, or several jobs that must run at the same time (one per
+     facility): `wait=False` returns the job id and its `record` at once;
+     submit them all, then `find_dispatched_jobs(directory=<artifact_dir>)`
+     for their state and `collect_dispatched_job(record=...)` for each finished
+     one (hep-genesis contract R10). Never block on one facility while a job
+     for the other is still to be submitted.
 4. Read the result: for env-kernels the kernel result is under
    `result["result"]` and `result["env_check"]` lists the versions found in the
    chosen environment - if `firecrown`/`pyccl` are `null` there, the
@@ -63,6 +69,7 @@ this server reproduces facility numbers - do that for figures and say so.
 
 `set_dispatch` on this server is only for deployments running on the user's
 own machine with the hep-genesis backend installed (check `auth_status`).
-Then the heavy tools dispatch themselves; env-kernel tools take `env_setup`
+Then the heavy tools dispatch themselves (`firecrown_run_chain(wait=False)` +
+`firecrown_collect_chain` for long chains); env-kernel tools take `env_setup`
 as an argument. It never affects, and is never affected by, other servers'
 dispatch state.
