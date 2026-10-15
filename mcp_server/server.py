@@ -11,6 +11,8 @@ from typing import Literal
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from mcp_server.dispatch import CALL_OUTPUT_DIR
+
 Transport = Literal["stdio", "streamable-http"]
 
 # Hosted deployments set these (same convention as the cosmic/spectra/gaia servers):
@@ -36,7 +38,12 @@ def publish_outputs(func):
             if not path.is_relative_to(root):
                 safe = "-".join(part for part in path.parts if part != "/")
                 bound.arguments["output_dir"] = str(root / (safe or "output"))
-        result = func(*bound.args, **bound.kwargs)
+        # dispatched jobs fetch into the confined dir, not the client's path
+        out_key = CALL_OUTPUT_DIR.set(bound.arguments.get("output_dir") or None)
+        try:
+            result = func(*bound.args, **bound.kwargs)
+        finally:
+            CALL_OUTPUT_DIR.reset(out_key)
         if ARTIFACT_URL and getattr(result, "files", None):
             urls = [f.replace(OUTPUT_ROOT, ARTIFACT_URL, 1)
                     for f in result.files if f.startswith(OUTPUT_ROOT)]
@@ -55,14 +62,54 @@ def publish_outputs(func):
 HEARTBEAT_S = float(os.environ.get("MCP_HEARTBEAT_S", "30"))
 # Heavy tools share process state (experiment caches, dispatch env vars) and
 # were serialized implicitly by blocking the event loop; keep them serialized.
-_HEAVY_LOCK: asyncio.Lock | None = None
+# Every other tool runs off the loop too, serialized per weight class: a
+# "dispatchable" tool used to run ON the event loop, and when it dispatched
+# (a CCL P(k) job behind a 1.5-h env build, 2026-10-14) the whole server froze
+# for hours - the running chain's heartbeats stopped, the client gave up after
+# 45 min and lost the job's handle.
+_LOCKS: dict[str, asyncio.Lock] = {}
+_HOLDERS: dict[str, str] = {}  # weight class -> name of the tool holding its lock
+
+
+def _lock(kind: str = "heavy") -> asyncio.Lock:
+    if kind not in _LOCKS:
+        _LOCKS[kind] = asyncio.Lock()
+    return _LOCKS[kind]
 
 
 def _heavy_lock() -> asyncio.Lock:
-    global _HEAVY_LOCK
-    if _HEAVY_LOCK is None:
-        _HEAVY_LOCK = asyncio.Lock()
-    return _HEAVY_LOCK
+    return _lock("heavy")
+
+
+async def acquire_heavy(ctx, label: str, heartbeat_s: float | None = None, kind: str = "heavy") -> None:
+    """Take the ``kind`` lock (default: the heavy-tool lock), heartbeating
+    while queued behind another call of that class. A queued call used to stay
+    silent until the lock freed; the client then gave up after its 45-min idle
+    timeout and recycled the whole session, which also killed the call that
+    held the lock (a running Perlmutter chain, 2026-10-14)."""
+    period = HEARTBEAT_S if heartbeat_s is None else heartbeat_s
+    lock = _lock(kind)
+    started = time.monotonic()
+    while True:
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=period)
+            break
+        except asyncio.TimeoutError:
+            if ctx is None:
+                continue
+            waited = int(time.monotonic() - started)
+            text = (f"{label}: queued for {waited // 60} min behind {_HOLDERS.get(kind) or 'another tool'} "
+                    f"(this server runs one {kind} tool at a time)")
+            try:
+                await ctx.report_progress(waited, None, text)
+            except Exception:  # noqa: BLE001 - progress is advisory
+                pass
+    _HOLDERS[kind] = label
+
+
+def release_heavy(kind: str = "heavy") -> None:
+    _HOLDERS[kind] = ""
+    _lock(kind).release()
 
 
 async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: float | None = None, **kwargs):
@@ -70,6 +117,17 @@ async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: flo
     notification every ``heartbeat_s`` seconds while it runs (no-op without
     a request context / progress token)."""
     period = HEARTBEAT_S if heartbeat_s is None else heartbeat_s
+    # This call's own engine progress slot (to_thread copies the context, so
+    # the dispatch running in the worker reports into it). The process-wide
+    # slot showed another call's job - or nothing, once that call's dispatch
+    # cleared it: "86 min elapsed (still running)" for a Perlmutter chain,
+    # 2026-10-14.
+    try:
+        from hep_genesis.iri.dispatch.progress import open_slot as _open_slot
+
+        slot = _open_slot()
+    except Exception:  # noqa: BLE001 - engine absent or old
+        slot = None
     task = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
     started = time.monotonic()
     try:
@@ -85,7 +143,7 @@ async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: flo
                     # state, elapsed time and stdout digest - say that instead
                     from hep_genesis.iri.dispatch.progress import message as _job_message
 
-                    live = _job_message()
+                    live = _job_message(slot) if slot is not None else _job_message()
                     if live:
                         text = f"{label}: {live}"
                 except Exception:  # noqa: BLE001 - engine absent or old
@@ -99,11 +157,13 @@ async def run_with_heartbeat(ctx, func, *args, label: str = "", heartbeat_s: flo
             task.cancel()
 
 
-def offload_heavy(func):
-    """Wrap a heavy (weight == "heavy") tool: it runs off the event loop under
-    the shared heavy lock and heartbeats progress while it runs. The MCP
-    schema is unchanged - the extra ``ctx`` parameter is the FastMCP
-    Context, injected by the server and hidden from clients."""
+def offload_heavy(func, kind: str | None = None):
+    """Wrap a tool so it runs off the event loop under its weight class's
+    lock (``kind``: default the tool's ``weight``, else "heavy") and
+    heartbeats progress while it runs. The MCP schema is unchanged - the
+    extra ``ctx`` parameter is the FastMCP Context, injected by the server
+    and hidden from clients."""
+    kind = kind or getattr(func, "weight", "heavy")
     # eval_str: tool modules using `from __future__ import annotations` carry
     # string annotations that only resolve in THEIR globals - the wrapper
     # lives here, so hand FastMCP/pydantic the resolved objects.
@@ -113,15 +173,22 @@ def offload_heavy(func):
 
     @functools.wraps(func)
     async def wrapper(*args, ctx: Context | None = None, **kwargs):
-        async with _heavy_lock():
-            return await run_with_heartbeat(ctx, func, *args, label=func.__name__, **kwargs)
+        await acquire_heavy(ctx, func.__name__, kind=kind)
+        out_key = CALL_OUTPUT_DIR.set(kwargs.get("output_dir") or None)
+        try:
+            # partial: a tool parameter named like ours (augur's `label`) must
+            # reach the tool, not collide with run_with_heartbeat's keywords
+            return await run_with_heartbeat(ctx, functools.partial(func, *args, **kwargs), label=func.__name__)
+        finally:
+            CALL_OUTPUT_DIR.reset(out_key)
+            release_heavy(kind)
 
     wrapper.__signature__ = sig.replace(parameters=params)
     annotations = {p.name: p.annotation for p in params if p.annotation is not inspect.Parameter.empty}
     if sig.return_annotation is not inspect.Signature.empty:
         annotations["return"] = sig.return_annotation
     wrapper.__annotations__ = annotations
-    wrapper.weight = getattr(func, "weight", "heavy")
+    wrapper.weight = kind
     return wrapper
 
 
@@ -214,8 +281,9 @@ def create_server(*, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
             tool_function = getattr(tool_module, name)
             if OUTPUT_ROOT:
                 tool_function = publish_outputs(tool_function)
-            if getattr(tool_function, "weight", "") == "heavy":
-                tool_function = offload_heavy(tool_function)
+            if not inspect.iscoroutinefunction(tool_function):
+                # heavy / dispatchable / light: each class serialized, all off the loop
+                tool_function = offload_heavy(tool_function, getattr(tool_function, "weight", "light"))
             mcp.tool()(tool_function)
 
     register_skill_prompts(mcp)

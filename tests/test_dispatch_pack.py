@@ -112,3 +112,28 @@ def test_env_kernel_opts_out_of_the_lock_env(monkeypatch):
     assert calls[-1]["env_lock"] is False and calls[-1]["function"] == "envkernel.run_in_env"
     d.run_kernel("inner.noop.main", {"params": {}}, duration=600)
     assert calls[-1]["env_lock"] is None  # lock env by default
+
+
+def test_job_lands_in_the_calls_output_dir(monkeypatch, tmp_path):
+    """A dispatched job's files + dispatch record go to <output_dir>/<kernel>_<ts>/
+    of the CALL, not the process-wide DISPATCH_ARTIFACT_DIR another chat set
+    (2026-10-14: four jobs from other chats landed in one chat's run folder)."""
+    import pytest
+
+    pytest.importorskip("hep_genesis")
+    from mcp_server import dispatch as d
+
+    calls = []
+    monkeypatch.setitem(d._state, "site", "perlmutter")
+    monkeypatch.setattr(d, "_engine", lambda: {"perlmutter": lambda **kw: (calls.append(kw) or {"status": "success", "result": {}})})
+    reset = d.CALL_OUTPUT_DIR.set(str(tmp_path))
+    try:
+        d.run_kernel("inner.firecrown_chain.main", {"params": {}}, duration=600)
+        d.run_env_kernel("source /x.sh", "noop", {}, duration=600)
+    finally:
+        d.CALL_OUTPUT_DIR.reset(reset)
+    chain, env = calls
+    assert chain["job_name"].startswith("firecrown_chain_") and chain["artifact_dir"] == str(tmp_path / chain["job_name"])
+    assert env["job_name"].startswith("noop_")
+    d.run_kernel("inner.noop.main", {"params": {}}, duration=600)  # no call context: engine defaults
+    assert "artifact_dir" not in calls[-1] and "job_name" not in calls[-1]

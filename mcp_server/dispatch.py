@@ -40,6 +40,7 @@ do not rename them.
 
 import importlib
 import os
+from contextvars import ContextVar
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -49,6 +50,28 @@ ENV_LOCK = "env/conda-lock.yml"
 ENV_FILES = ("env/conda-lock.yml", "env/environment.yml")
 
 _state = {"site": "local"}
+
+# The output_dir of the tool call being served (set by the server's tool
+# wrapper; asyncio.to_thread carries it into the worker). A dispatched job's
+# files and its dispatch_<job>.json record go to <output_dir>/<job>/ - the
+# CALL's own run folder. The process-wide DISPATCH_ARTIFACT_DIR is shared by
+# every conversation on this server: one chat's set_dispatch(artifact_dir=)
+# pulled other chats' jobs into its run folder (2026-10-14).
+CALL_OUTPUT_DIR: ContextVar[str | None] = ContextVar("desc_call_output_dir", default=None)
+
+
+def _job_placement(function: str, args: dict) -> dict:
+    """job_name + artifact_dir for this call's job ({} = engine defaults)."""
+    out = CALL_OUTPUT_DIR.get()
+    if not out:
+        return {}
+    try:
+        from hep_genesis.iri.dispatch.staging import default_job_name
+    except ImportError:  # older engine: keep its defaults
+        return {}
+    named = f"inner.{args['inner']}.main" if function == "envkernel.run_in_env" and args.get("inner") else function
+    job_name = default_job_name(named)
+    return {"job_name": job_name, "artifact_dir": str(Path(out).expanduser() / job_name)}
 
 __all__ = ["set_dispatch", "get_dispatch", "auth_status", "export_dispatch_pack"]
 
@@ -214,7 +237,8 @@ def run_kernel(function: str, args: dict, pip_deps: list[str] | None = None,
         shape = {k: v for k, v in (("tasks_per_node", tasks_per_node), ("cpus_per_task", cpus_per_task),
                                    ("gpus_per_task", gpus_per_task)) if v}
         result = run(function=function, args=args, codes=str(TOOLS_DIR),
-                     pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock, **shape)
+                     pip_deps=pip_deps, duration=duration, nodes=nodes, env_lock=env_lock,
+                     **_job_placement(function, args), **shape)
     except Exception as exc:
         body = ""
         resp = getattr(exc, "response", None)
